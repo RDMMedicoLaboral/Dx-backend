@@ -24,13 +24,18 @@ app.use(morgan("tiny"));
 app.get("/", (_req, res) => res.json({ ok: true, service: "diagnostic-os-backend" }));
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
+// El orden importa: como clinicalRoutes se monta en el prefijo genérico "/api",
+// tiene que ir DESPUÉS de todas las rutas más específicas (/api/auth,
+// /api/admin, /api/fhir, /api/public, /api/uploads, /api/dev) — si no, su
+// middleware de autenticación intercepta cualquier request que empiece con
+// "/api/..." antes de que le toque el turno a las demás.
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
-app.use("/api", clinicalRoutes);
 app.use("/api/fhir", fhirRoutes);
 app.use("/api/public", publicRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/dev", devRoutes);
+app.use("/api", clinicalRoutes);
 
 app.use((err, _req, res, _next) => {
   console.error(err);
