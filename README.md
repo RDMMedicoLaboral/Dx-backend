@@ -39,8 +39,8 @@ pantalla — solo cambiar de dónde vienen los datos.
 ### 3. Crear el servicio en Render
 
 1. Ve a [render.com](https://render.com) → **New → Web Service**.
-2. Conecta tu cuenta de GitHub y elige el repositorio donde subiste el proyecto.
-3. Como el backend está en la subcarpeta `backend/` de tu repo, en **Root Directory** escribe: `backend`
+2. Conecta tu cuenta de GitHub y elige el repositorio (`Dx-backend` o el que hayas usado).
+3. **Root Directory:** déjalo **vacío**. Solo se pone algo ahí si el backend está dentro de una subcarpeta de tu repo; si subiste `prisma/`, `src/`, `package.json` directo a la raíz del repo (como en `Dx-backend`), este campo debe quedar en blanco — si pusiste `backend` y te salió el error *"Root directory 'backend' does not exist"*, entra a **Settings → Build → Root Directory → Edit** y bórralo.
 4. Configura:
    - **Build Command:** `npm install && npx prisma generate && npx prisma migrate deploy`
    - **Start Command:** `npm run start`
@@ -49,23 +49,34 @@ pantalla — solo cambiar de dónde vienen los datos.
    | Key | Value |
    |---|---|
    | `DATABASE_URL` | el connection string de Neon (paso 1) |
-   | `JWT_SECRET` | cualquier texto largo y aleatorio (ej. genera uno en [1password.com/password-generator](https://1password.com/password-generator/)) |
-   | `CORS_ORIGINS` | la URL de tu GitHub Pages, ej. `https://rdmmedicolaboral.github.io` |
-   | `CLOUDINARY_CLOUD_NAME` | del paso 2 |
+   | `JWT_SECRET` | clic en "Generate" |
+   | `CORS_ORIGINS` | la URL raíz de tu GitHub Pages, ej. `https://rdmmedicolaboral.github.io` (sin `/` ni subcarpetas al final) |
+   | `CLOUDINARY_CLOUD_NAME` | del paso 2 (ojo con el nombre exacto de la variable) |
    | `CLOUDINARY_API_KEY` | del paso 2 |
    | `CLOUDINARY_API_SECRET` | del paso 2 |
+   | `SEED_KEY` | clic en "Generate" — la usarás en el paso 4 |
    | `NODE_ENV` | `production` |
-6. Clic en **Create Web Service**. Render va a instalar, compilar y crear las tablas automáticamente (el build command incluye `prisma migrate deploy`). Esto tarda 2-5 minutos — puedes ver el progreso en la pestaña **Logs**.
+6. Clic en **Create Web Service**. Render instala, compila y crea las tablas automáticamente (el build command incluye `prisma migrate deploy`). Tarda 2-5 minutos — puedes ver el progreso en la pestaña **Logs**.
 
-### 4. Cargar los datos de demostración (una sola vez)
+### 4. Cargar los datos de demostración (sin usar Shell)
 
-Cuando el deploy termine ("Live" en verde):
-1. En Render, abre tu servicio → pestaña **Shell** (arriba a la derecha).
-2. Corre:
-   ```bash
-   npm run seed
+El plan gratuito de Render **no incluye acceso a Shell** (te pide upgrade). Para
+esto agregamos una URL especial que hace lo mismo:
+
+1. Copia el valor de `SEED_KEY` que generaste (Render → tu servicio → **Environment** → clic en el ojito junto a `SEED_KEY`).
+2. Con el deploy ya en verde ("Live"), abre en el navegador:
    ```
-3. Deberías ver un mensaje confirmando las cuentas de demo creadas.
+   https://TU-SERVICIO.onrender.com/api/dev/seed?key=TU_SEED_KEY
+   ```
+   (reemplaza `TU-SERVICIO` por el nombre real que te dio Render, y `TU_SEED_KEY` por el valor copiado).
+3. Deberías ver un JSON como:
+   ```json
+   { "ok": true, "message": "Datos de demostración cargados.", "credenciales": { ... } }
+   ```
+   Puedes visitar esa URL más de una vez sin problema — no duplica nada.
+
+> **Seguridad:** esta ruta solo funciona si conoces `SEED_KEY`, así que es segura mientras no compartas esa clave. Aun así, una vez que ya no la necesites, puedes borrar el archivo `src/routes/dev.js` (y su línea en `src/index.js`) y volver a subir el repo.
+
 
 ### 5. Probar que funciona
 
