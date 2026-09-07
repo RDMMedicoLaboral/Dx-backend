@@ -42,9 +42,11 @@ pantalla — solo cambiar de dónde vienen los datos.
 2. Conecta tu cuenta de GitHub y elige el repositorio (`Dx-backend` o el que hayas usado).
 3. **Root Directory:** déjalo **vacío**. Solo se pone algo ahí si el backend está dentro de una subcarpeta de tu repo; si subiste `prisma/`, `src/`, `package.json` directo a la raíz del repo (como en `Dx-backend`), este campo debe quedar en blanco — si pusiste `backend` y te salió el error *"Root directory 'backend' does not exist"*, entra a **Settings → Build → Root Directory → Edit** y bórralo.
 4. Configura:
-   - **Build Command:** `npm install && npx prisma generate && npx prisma migrate deploy`
+   - **Build Command:** `npm install && npx prisma generate && npx prisma db push`
    - **Start Command:** `npm run start`
    - **Instance Type:** Free
+
+   > Usamos `prisma db push` en vez de `prisma migrate deploy` porque este último necesita archivos de "migración" que se generan corriendo Prisma con internet completo (algo que no pude hacer yo al armar esto). `db push` crea/actualiza las tablas directamente a partir de `schema.prisma`, sin ese paso extra — perfecto para esta etapa. Si más adelante quieres un historial de migraciones prolijo, se puede migrar a `migrate deploy` corriendo `npx prisma migrate dev` una vez desde tu computadora con internet.
 5. Antes de darle a "Create", baja a **Environment Variables** y agrega:
    | Key | Value |
    |---|---|
