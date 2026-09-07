@@ -1,0 +1,327 @@
+// ---------------------------------------------------------------------------------
+// Esquema de base de datos de Diagnostic OS.
+// Refleja 1:1 el modelo que ya usaba el frontend en src/data/models.js, para que
+// migrar de localStorage a este backend no obligue a rediseñar pantallas.
+// ---------------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Attachment {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  // A qué se adjunta: "Patient" | "Study" | "DiagnosticReport" | "Order" ...
+  entityType String
+  entityId   String
+
+  url          String // URL segura de Cloudinary, lista para mostrar/descargar
+  publicId     String // id en Cloudinary, para poder borrarlo si hace falta
+  resourceType String // image | video | raw (pdf, doc, etc.)
+  format       String?
+  bytes        Int?
+  caption      String  @default("")
+
+  uploadedById String?
+  uploadedBy   User?   @relation(fields: [uploadedById], references: [id])
+  createdAt    DateTime @default(now())
+
+  @@index([tenantId])
+  @@index([entityType, entityId])
+}
+
+model Tenant {
+  id   String @id @default(cuid())
+  name String
+  kind String // Laboratorio | Centro de imágenes | Centro mixto
+  plan String @default("Estándar")
+
+  hoursOpen  String @default("08:00")
+  hoursClose String @default("18:00")
+
+  // Conector de terceros (HCE/LIS/RIS/PACS) — configurado solo por el superadmin.
+  thirdPartyName     String  @default("Conector de terceros")
+  thirdPartyType     String  @default("HIS / LIS / RIS / PACS")
+  thirdPartyProtocol String  @default("A definir por contrato")
+  thirdPartyBaseUrl  String?
+  thirdPartyApiKey   String?
+  thirdPartyStatus   String  @default("No configurado") // No configurado | Conectado
+
+  createdAt DateTime @default(now())
+
+  users               User[]
+  patients            Patient[]
+  orders              Order[]
+  studies             Study[]
+  specimens           Specimen[]
+  results             Result[]
+  reports             DiagnosticReport[]
+  catalogItems        CatalogItem[]
+  appointments        Appointment[]
+  integrationMessages IntegrationMessage[]
+  auditEvents         AuditEvent[]
+  attachments         Attachment[]
+}
+
+// dueno | platform_admin | recepcion | laboratorista | responsable_laboratorio |
+// tecnologo_rx | ecografista | radiologo | auditor
+model User {
+  id           String  @id @default(cuid())
+  tenantId     String?
+  tenant       Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  name         String
+  email        String  @unique
+  passwordHash String
+  role         String
+
+  createdAt DateTime @default(now())
+  auditEvents AuditEvent[]
+  attachments Attachment[]
+}
+
+model Patient {
+  id             String   @id @default(cuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  firstName      String
+  lastName       String
+  documentType   String   @default("cedula")
+  documentNumber String
+  birthDate      String?
+  sex            String?
+  externalIdentifiers Json @default("[]")
+  sourceSystem     String?
+  sourcePatientId  String?
+  matchStatus      String  @default("confirmado") // confirmado | pendiente | posible_duplicado
+  createdAt        DateTime @default(now())
+
+  orders  Order[]
+  studies Study[]
+  reports DiagnosticReport[]
+
+  @@index([tenantId])
+  @@index([tenantId, documentNumber])
+}
+
+model Order {
+  id             String   @id @default(cuid())
+  tenantId       String
+  tenant         Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  patientId      String
+  patient        Patient  @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  externalOrderId String?
+  sourceSystem    String?
+  sourceType      String  @default("interno") // interno | HCE | Agenda | Portal
+  requestingPractitioner Json?
+  requestingOrganization String?
+  encounterId     String?
+  appointmentId   String?
+  reason          String?
+  presumptiveDiagnosis String?
+  priority        String  @default("rutina") // rutina | prioritaria | urgente | emergencia
+  notes           String?
+  status          String  @default("active") // draft | active | scheduled | cancelled | completed
+
+  createdAt   DateTime  @default(now())
+  scheduledAt DateTime?
+  receivedAt  DateTime?
+  completedAt DateTime?
+
+  studies Study[]
+  reports DiagnosticReport[]
+
+  @@index([tenantId])
+}
+
+model Study {
+  id            String  @id @default(cuid())
+  tenantId      String
+  tenant        Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  orderId       String
+  order         Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  patientId     String
+  patient       Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  serviceCode String
+  serviceName String
+  modality    String // LAB | RX | ECO | ...
+  status      String  @default("scheduled") // scheduled | arrived | in-progress | completed | cancelled
+  room        String  @default("")
+  equipment   String  @default("")
+  technician  String  @default("")
+
+  scheduledAt DateTime  @default(now())
+  startedAt   DateTime?
+  completedAt DateTime?
+
+  externalStudyId  String?
+  bodySite         String  @default("")
+  laterality       String  @default("")
+  technique        String  @default("")
+  accessionNumber  String?
+  studyInstanceUID String?
+  specimenId       String?
+  reportId         String?
+
+  specimens Specimen[]
+  results   Result[]
+
+  @@index([tenantId])
+}
+
+model Specimen {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  studyId  String
+  study    Study  @relation(fields: [studyId], references: [id], onDelete: Cascade)
+
+  type            String
+  status          String  @default("pending") // pending | collected | received | rejected | processing | completed
+  createdAt       DateTime @default(now())
+  collectedAt     DateTime?
+  receivedAt      DateTime?
+  quality         String?
+  rejectionReason String?
+
+  results Result[]
+
+  @@index([tenantId])
+}
+
+model Result {
+  id         String    @id @default(cuid())
+  tenantId   String
+  tenant     Tenant    @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  studyId    String
+  study      Study     @relation(fields: [studyId], references: [id], onDelete: Cascade)
+  specimenId String?
+  specimen   Specimen? @relation(fields: [specimenId], references: [id])
+
+  analyte        String
+  value          String  @default("")
+  unit           String  @default("")
+  referenceRange String  @default("")
+  flag           String  @default("normal") // normal | alto | bajo | critico
+  method         String  @default("")
+  status         String  @default("draft") // draft | resulted | validated | corrected
+  critical       Boolean @default(false)
+  criticalNotifiedAt DateTime?
+
+  @@index([tenantId])
+}
+
+model DiagnosticReport {
+  id        String  @id @default(cuid())
+  tenantId  String
+  tenant    Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  studyId   String
+  orderId   String
+  order     Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  patientId String
+  patient   Patient @relation(fields: [patientId], references: [id], onDelete: Cascade)
+
+  type   String // LAB | IMAGING
+  status String @default("draft") // draft | pending-validation | validated | published | amended
+
+  authorId      String?
+  authorName    String?
+  validatorId   String?
+  validatorName String?
+
+  conclusion String  @default("")
+  findings   String  @default("")
+  impression String  @default("")
+  resultIds  Json    @default("[]")
+  version    Int     @default(1)
+  amendmentReason String @default("")
+  pdfRef     String?
+
+  createdAt   DateTime  @default(now())
+  validatedAt DateTime?
+  publishedAt DateTime?
+
+  @@index([tenantId])
+}
+
+model CatalogItem {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  code           String
+  name           String
+  modality       String
+  price          Float   @default(0)
+  active         Boolean @default(true)
+  preparation    String  @default("")
+  estimatedTime  String  @default("")
+  externalCodes  Json    @default("[]")
+  reportTemplate Json    @default("{}")
+
+  @@index([tenantId])
+}
+
+model Appointment {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  patientName    String
+  documentNumber String
+  serviceCode    String
+  serviceName    String
+  modality       String
+  scheduledAt    DateTime
+  source         String   @default("Reserva en línea")
+  createdAt      DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+model IntegrationMessage {
+  id            String @id @default(cuid())
+  tenantId      String
+  tenant        Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  eventId       String @default(cuid())
+  correlationId String @default(cuid())
+  type          String // AppointmentReceived | ServiceRequestReceived | ... | IntegrationFailed
+  direction     String // inbound | outbound
+  source        String
+  destination   String
+  status        String  @default("pending") // pending | sent | acknowledged | duplicate | failed | retrying
+  payloadSummary String @default("")
+  attempts      Int     @default(1)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([tenantId])
+}
+
+model AuditEvent {
+  id       String  @id @default(cuid())
+  tenantId String?
+  tenant   Tenant? @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  userId   String?
+  user     User?   @relation(fields: [userId], references: [id])
+  userName String?
+
+  action     String // "order.create", "result.validate", "report.publish", ...
+  entityType String // Patient | Order | Study | Result | DiagnosticReport | User | Tenant | IntegrationMessage
+  entityId   String?
+  before     Json?
+  after      Json?
+  timestamp  DateTime @default(now())
+
+  @@index([tenantId])
+}
