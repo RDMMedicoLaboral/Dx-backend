@@ -6,7 +6,7 @@ const router = Router();
 // Lista de centros y su catálogo activo, para el selector de la página de reservas.
 router.get("/tenants", async (_req, res) => {
   const tenants = await prisma.tenant.findMany({ select: { id: true, name: true, kind: true, hoursOpen: true, hoursClose: true } });
-  res.json(tenants);
+  res.json(tenants.map((t) => ({ id: t.id, name: t.name, kind: t.kind, hours: { open: t.hoursOpen, close: t.hoursClose } })));
 });
 
 router.get("/tenants/:tenantId/catalog", async (req, res) => {
