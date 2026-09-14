@@ -11,6 +11,7 @@ import publicRoutes from "./routes/public.js";
 import uploadRoutes from "./routes/uploads.js";
 import devRoutes from "./routes/dev.js";
 import stateRoutes from "./routes/state.js";
+import catalogImportRoutes from "./routes/catalogImport.js";
 
 const app = express();
 
@@ -37,6 +38,7 @@ app.use("/api/public", publicRoutes);
 app.use("/api/uploads", uploadRoutes);
 app.use("/api/dev", devRoutes);
 app.use("/api/state", stateRoutes);
+app.use("/api/catalog-import", catalogImportRoutes);
 app.use("/api", clinicalRoutes);
 
 app.use((err, _req, res, _next) => {
