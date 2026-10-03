@@ -33,7 +33,7 @@ function publicUser(u) {
 
 router.get("/", async (req, res) => {
   const tenantId = req.user.tenantId;
-  const [tenant, users, patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents] = await Promise.all([
+  const [tenant, users, patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents, convenios, quotes, cashSessions, cashMovements] = await Promise.all([
     prisma.tenant.findUnique({ where: { id: tenantId } }),
     prisma.user.findMany({ where: { tenantId } }),
     prisma.patient.findMany({ where: { tenantId } }),
@@ -46,6 +46,10 @@ router.get("/", async (req, res) => {
     prisma.appointment.findMany({ where: { tenantId }, orderBy: { scheduledAt: "asc" } }),
     prisma.integrationMessage.findMany({ where: { tenantId }, orderBy: { createdAt: "desc" } }),
     prisma.auditEvent.findMany({ where: { tenantId }, orderBy: { timestamp: "desc" }, take: 300 }),
+    prisma.convenio.findMany({ where: { tenantId } }),
+    prisma.quote.findMany({ where: { tenantId }, orderBy: { createdAt: "desc" } }),
+    prisma.cashSession.findMany({ where: { tenantId }, orderBy: { openedAt: "desc" }, take: 30 }),
+    prisma.cashMovement.findMany({ where: { tenantId }, orderBy: { createdAt: "desc" }, take: 500 }),
   ]);
 
   const tenantOut = tenant ? { id: tenant.id, name: tenant.name, kind: tenant.kind, plan: tenant.plan, hours: { open: tenant.hoursOpen, close: tenant.hoursClose } } : null;
@@ -54,6 +58,7 @@ router.get("/", async (req, res) => {
     tenant: tenantOut,
     users: users.map(publicUser),
     patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents,
+    convenios, quotes, cashSessions, cashMovements,
   });
 });
 
@@ -106,6 +111,7 @@ router.put("/", async (req, res) => {
         requestingOrganization: o.requestingOrganization || null, encounterId: o.encounterId || null, appointmentId: o.appointmentId || null,
         reason: o.reason || "", presumptiveDiagnosis: o.presumptiveDiagnosis || "", priority: o.priority || "rutina", notes: o.notes || "",
         status: o.status || "active", createdAt: d(o.createdAt) || undefined, scheduledAt: d(o.scheduledAt), receivedAt: d(o.receivedAt), completedAt: d(o.completedAt),
+        convenioId: o.convenioId || null, convenioName: o.convenioName || "Particular", totalAmount: Number(o.totalAmount) || 0, paidAmount: Number(o.paidAmount) || 0,
       }));
     }
 
@@ -177,6 +183,40 @@ router.put("/", async (req, res) => {
           update: {},
         });
       }
+    }
+
+    if (body.convenios) {
+      await syncCollection(prisma.convenio, tenantId, body.convenios, (c) => ({
+        name: c.name, type: c.type || "particular", discountPercent: Number(c.discountPercent) || 0,
+        contactInfo: c.contactInfo || "", active: c.active !== false, createdAt: d(c.createdAt) || undefined,
+      }));
+    }
+
+    if (body.quotes) {
+      await syncCollection(prisma.quote, tenantId, body.quotes, (q) => ({
+        patientName: q.patientName, documentNumber: q.documentNumber || "", patientId: q.patientId || null,
+        convenioId: q.convenioId || null, convenioName: q.convenioName || "Particular", items: j(q.items, []),
+        subtotal: Number(q.subtotal) || 0, discountTotal: Number(q.discountTotal) || 0, total: Number(q.total) || 0,
+        status: q.status || "draft", validUntil: d(q.validUntil), orderId: q.orderId || null,
+        createdAt: d(q.createdAt) || undefined, createdById: q.createdById || null, createdByName: q.createdByName || "",
+      }));
+    }
+
+    if (body.cashSessions) {
+      await syncCollection(prisma.cashSession, tenantId, body.cashSessions, (s) => ({
+        openedById: s.openedById || null, openedByName: s.openedByName || "", openedAt: d(s.openedAt) || undefined,
+        openingAmount: Number(s.openingAmount) || 0, closedById: s.closedById || null, closedByName: s.closedByName || null,
+        closedAt: d(s.closedAt), closingAmount: s.closingAmount === null || s.closingAmount === undefined ? null : Number(s.closingAmount),
+        status: s.status || "open", notes: s.notes || "",
+      }));
+    }
+
+    if (body.cashMovements) {
+      await syncCollection(prisma.cashMovement, tenantId, body.cashMovements, (m) => ({
+        cashSessionId: m.cashSessionId, orderId: m.orderId || null, type: m.type || "ingreso", method: m.method || "efectivo",
+        amount: Number(m.amount) || 0, concept: m.concept || "", createdAt: d(m.createdAt) || undefined,
+        createdById: m.createdById || null, createdByName: m.createdByName || "",
+      }));
     }
 
     res.json({ ok: true });

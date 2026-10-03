@@ -68,6 +68,10 @@ model Tenant {
   integrationMessages IntegrationMessage[]
   auditEvents         AuditEvent[]
   attachments         Attachment[]
+  convenios           Convenio[]
+  quotes              Quote[]
+  cashSessions        CashSession[]
+  cashMovements       CashMovement[]
 }
 
 // dueno | platform_admin | recepcion | laboratorista | responsable_laboratorio |
@@ -129,6 +133,11 @@ model Order {
   priority        String  @default("rutina") // rutina | prioritaria | urgente | emergencia
   notes           String?
   status          String  @default("active") // draft | active | scheduled | cancelled | completed
+
+  convenioId   String?
+  convenioName String  @default("Particular")
+  totalAmount  Float   @default(0)
+  paidAmount   Float   @default(0)
 
   createdAt   DateTime  @default(now())
   scheduledAt DateTime?
@@ -324,4 +333,95 @@ model AuditEvent {
   timestamp  DateTime @default(now())
 
   @@index([tenantId])
+}
+
+// ---------------------------------------------------------------------------------
+// Facturación básica: convenios (tarifas por particular/empresa/seguro),
+// cotizaciones (presupuestos convertibles en orden) y caja (apertura/cierre y
+// movimientos de pago). Se sincronizan igual que el resto del estado clínico,
+// vía /api/state.
+// ---------------------------------------------------------------------------------
+
+model Convenio {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name            String
+  type            String  @default("particular") // particular | empresa | seguro
+  discountPercent Float   @default(0)
+  contactInfo     String  @default("")
+  active          Boolean @default(true)
+  createdAt       DateTime @default(now())
+
+  @@index([tenantId])
+}
+
+model Quote {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  patientName    String
+  documentNumber String  @default("")
+  patientId      String?
+  convenioId     String?
+  convenioName   String  @default("Particular")
+  items          Json    @default("[]") // [{code, name, price, qty}]
+  subtotal       Float   @default(0)
+  discountTotal  Float   @default(0)
+  total          Float   @default(0)
+  status         String  @default("draft") // draft | sent | accepted | expired | converted
+  validUntil     DateTime?
+  orderId        String? // si se convirtió en orden
+
+  createdAt     DateTime @default(now())
+  createdById   String?
+  createdByName String  @default("")
+
+  @@index([tenantId])
+}
+
+model CashSession {
+  id       String @id @default(cuid())
+  tenantId String
+  tenant   Tenant @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  openedById    String?
+  openedByName  String  @default("")
+  openedAt      DateTime @default(now())
+  openingAmount Float   @default(0)
+
+  closedById    String?
+  closedByName  String?
+  closedAt      DateTime?
+  closingAmount Float?
+
+  status String  @default("open") // open | closed
+  notes  String  @default("")
+
+  movements CashMovement[]
+
+  @@index([tenantId])
+}
+
+model CashMovement {
+  id            String       @id @default(cuid())
+  tenantId      String
+  tenant        Tenant       @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  cashSessionId String
+  cashSession   CashSession  @relation(fields: [cashSessionId], references: [id], onDelete: Cascade)
+
+  orderId String?
+  type    String  @default("ingreso") // ingreso | egreso
+  method  String  @default("efectivo") // efectivo | tarjeta | transferencia
+  amount  Float   @default(0)
+  concept String  @default("")
+
+  createdAt     DateTime @default(now())
+  createdById   String?
+  createdByName String  @default("")
+
+  @@index([tenantId])
+  @@index([cashSessionId])
 }
