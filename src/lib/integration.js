@@ -1,45 +1,26 @@
 import { prisma } from "./prisma.js";
-import { reportToDiagnosticReport } from "./fhir.js";
+import { createIntegration } from "./integrationCore.js";
 
-// Al publicar un informe, si el centro tiene un conector externo configurado
-// (por el superadmin, en /api/admin), se lo enviamos al HCE en formato FHIR
-// DiagnosticReport. Queda registrado como IntegrationMessage saliente para que
-// se vea en el panel de integraciones, sea que el envío haya funcionado o no.
-export async function pushReportToConnector(tenantId, report) {
-  const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } });
-  if (!tenant?.thirdPartyBaseUrl) return; // no configurado: no hay nada que hacer
+// Instancia real (con la base de datos de verdad). La lógica está en integrationCore.js.
+const integration = createIntegration({ db: prisma });
 
-  const [order, study] = await Promise.all([
-    prisma.order.findUnique({ where: { id: report.orderId } }),
-    prisma.study.findUnique({ where: { id: report.studyId } }),
-  ]);
-  const fhirPayload = reportToDiagnosticReport(report, order, study);
+export const pushReportToConnector = (tenantId, reportId, opts) => integration.pushReport(tenantId, reportId, opts);
+export const retryIntegrationMessage = (messageId, opts) => integration.retryMessage(messageId, opts);
+export const testConnector = (tenantId) => integration.testConnection(tenantId);
+export const connectorOf = integration.connectorOf;
 
-  const message = await prisma.integrationMessage.create({
-    data: {
-      tenantId, type: "ReportPublished", direction: "outbound",
-      source: "Diagnostic OS", destination: tenant.thirdPartyName || "Conector de terceros",
-      status: "sent", payloadSummary: `DiagnosticReport/${report.id} → ${tenant.thirdPartyBaseUrl}`,
-    },
-  });
-
-  try {
-    const resp = await fetch(`${tenant.thirdPartyBaseUrl.replace(/\/$/, "")}/DiagnosticReport`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/fhir+json",
-        ...(tenant.thirdPartyApiKey ? { Authorization: `Bearer ${tenant.thirdPartyApiKey}` } : {}),
-      },
-      body: JSON.stringify(fhirPayload),
-    });
-    await prisma.integrationMessage.update({
-      where: { id: message.id },
-      data: { status: resp.ok ? "acknowledged" : "failed", payloadSummary: `${message.payloadSummary} — HTTP ${resp.status}` },
-    });
-  } catch (err) {
-    await prisma.integrationMessage.update({
-      where: { id: message.id },
-      data: { status: "failed", payloadSummary: `${message.payloadSummary} — ${err.message}` },
-    });
-  }
+// Reintento automático de envíos fallidos. En el plan gratuito de Render el servicio se duerme
+// tras 15 min sin tráfico: al despertar, este temporizador retoma lo pendiente.
+let timer = null;
+export function startRetryWorker({ everyMs = 60000 } = {}) {
+  if (timer) return;
+  let running = false;
+  const tick = async () => {
+    if (running) return;
+    running = true;
+    try { await integration.retryDue(); } catch (err) { console.error("[integración] fallo en el ciclo de reintentos:", err.message); } finally { running = false; }
+  };
+  timer = setInterval(tick, everyMs);
+  timer.unref?.();
+  setTimeout(tick, 5000).unref?.(); // un primer barrido poco después de arrancar
 }

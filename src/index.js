@@ -1,4 +1,5 @@
 import "dotenv/config";
+import "./lib/asyncErrors.js"; // debe ir antes de crear rutas
 import express from "express";
 import cors from "cors";
 import morgan from "morgan";
@@ -12,6 +13,12 @@ import uploadRoutes from "./routes/uploads.js";
 import devRoutes from "./routes/dev.js";
 import stateRoutes from "./routes/state.js";
 import catalogImportRoutes from "./routes/catalogImport.js";
+import { startRetryWorker } from "./lib/integration.js";
+
+if (!process.env.JWT_SECRET) {
+  console.error("Falta JWT_SECRET: sin él no se pueden firmar sesiones ni cifrar los secretos de integración.");
+  process.exit(1);
+}
 
 const app = express();
 
@@ -47,4 +54,7 @@ app.use((err, _req, res, _next) => {
 });
 
 const port = process.env.PORT || 4000;
-app.listen(port, () => console.log(`Diagnostic OS backend escuchando en el puerto ${port}`));
+app.listen(port, () => {
+  console.log(`Diagnostic OS backend escuchando en el puerto ${port}`);
+  startRetryWorker(); // reintenta solo los envíos fallidos hacia el sistema conectado
+});

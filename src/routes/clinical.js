@@ -153,9 +153,17 @@ router.patch("/reports/:id/publish", requirePermission(PERMISSIONS.PUBLISH_REPOR
   const updated = await prisma.diagnosticReport.update({ where: { id: report.id }, data: { status: "published", publishedAt: new Date() } });
   await logAudit({ tenantId: tid(req), userId: req.user.id, userName: req.user.name, action: "report.publish", entityType: "DiagnosticReport", entityId: report.id });
 
-  pushReportToConnector(tid(req), updated).catch(() => {}); // mejor esfuerzo, no bloquea la respuesta
+  pushReportToConnector(tid(req), updated.id).catch((err) => console.error("[integración] publish:", err.message)); // no bloquea la respuesta; los fallos quedan registrados y se reintentan
 
   res.json({ ok: true });
+});
+
+// Reenvío manual de un informe ya publicado al sistema conectado (botón "Compartir con sistemas externos").
+router.post("/reports/:id/resend", requirePermission(PERMISSIONS.PUBLISH_REPORT), async (req, res) => {
+  const result = await pushReportToConnector(tid(req), req.params.id, { force: true });
+  if (!result.message) return res.status(409).json({ error: result.skipped || "No se pudo reenviar el informe." });
+  await logAudit({ tenantId: tid(req), userId: req.user.id, userName: req.user.name, action: "report.resend", entityType: "DiagnosticReport", entityId: req.params.id, after: { status: result.message.status } });
+  res.json({ ok: !["failed", "skipped"].includes(result.message.status), status: result.message.status, error: result.message.lastError || undefined, summary: result.message.payloadSummary });
 });
 
 // --- Catálogo de estudios ----------------------------------------------------------

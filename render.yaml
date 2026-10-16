@@ -27,6 +27,8 @@ services:
         sync: false
       - key: CLOUDINARY_API_SECRET
         sync: false
+      - key: INTEGRATION_ENC_KEY
+        generateValue: true # cifra los secretos de integración guardados en la base
       - key: SEED_KEY
         generateValue: true
       - key: NODE_ENV

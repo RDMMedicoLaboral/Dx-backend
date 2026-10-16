@@ -3,6 +3,8 @@ import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma.js";
 import { authenticate, requirePlatformAdmin } from "../middleware/auth.js";
 import { logAudit } from "../lib/audit.js";
+import { encryptSecret, generateApiKey, sha256Hex } from "../lib/secrets.js";
+import { pushReportToConnector, retryIntegrationMessage, testConnector } from "../lib/integration.js";
 
 const router = Router();
 router.use(authenticate, requirePlatformAdmin);
@@ -11,11 +13,36 @@ function publicUser(u) {
   return { id: u.id, tenantId: u.tenantId, name: u.name, email: u.email, role: u.role, createdAt: u.createdAt };
 }
 
+// Nunca devolvemos secretos al navegador: solo si existen o no.
+function publicTenant(t) {
+  if (!t) return t;
+  const { thirdPartyApiKey, thirdPartyClientSecret, inboundKeyHash, ...rest } = t;
+  return { ...rest, thirdPartyApiKeySet: Boolean(thirdPartyApiKey), thirdPartyClientSecretSet: Boolean(thirdPartyClientSecret), inboundKeySet: Boolean(inboundKeyHash) };
+}
+
+// Valida una URL de conector: http(s), sin usuario/clave incrustados, y https obligatorio en
+// producción (salvo localhost, para poder probar en tu computadora).
+function checkUrl(value, label) {
+  let u;
+  try { u = new URL(value); } catch { throw Object.assign(new Error(`${label}: la URL no es válida.`), { status: 400 }); }
+  if (!["http:", "https:"].includes(u.protocol)) throw Object.assign(new Error(`${label}: debe empezar con https://`), { status: 400 });
+  if (u.username || u.password) throw Object.assign(new Error(`${label}: no incluyas usuario ni clave dentro de la URL.`), { status: 400 });
+  const local = ["localhost", "127.0.0.1", "::1"].includes(u.hostname);
+  if (process.env.NODE_ENV === "production" && u.protocol !== "https:" && !local) throw Object.assign(new Error(`${label}: en producción se exige https://`), { status: 400 });
+  return value.trim().replace(/\/+$/, "");
+}
+
+// Para secretos: texto no vacío = guardar; null = borrar; vacío/ausente = dejar como está.
+function applySecret(data, field, value) {
+  if (typeof value === "string" && value.trim()) data[field] = encryptSecret(value.trim());
+  else if (value === null) data[field] = null;
+}
+
 // --- Centros -----------------------------------------------------------------
 
 router.get("/tenants", async (req, res) => {
   const tenants = await prisma.tenant.findMany({ orderBy: { createdAt: "asc" }, include: { _count: { select: { users: true } } } });
-  res.json(tenants);
+  res.json(tenants.map(publicTenant));
 });
 
 router.post("/tenants", async (req, res) => {
@@ -33,7 +60,7 @@ router.post("/tenants", async (req, res) => {
 
   await logAudit({ tenantId: tenant.id, userId: req.user.id, userName: req.user.name, action: "tenant.create", entityType: "Tenant", entityId: tenant.id, after: { name: tenant.name, owner: owner.email } });
 
-  res.status(201).json({ tenant, owner: publicUser(owner) });
+  res.status(201).json({ tenant: publicTenant(tenant), owner: publicUser(owner) });
 });
 
 router.patch("/tenants/:id", async (req, res) => {
@@ -46,17 +73,42 @@ router.patch("/tenants/:id", async (req, res) => {
   if (hoursOpen) data.hoursOpen = hoursOpen;
   if (hoursClose) data.hoursClose = hoursClose;
   if (thirdPartyConnector) {
-    if (thirdPartyConnector.name) data.thirdPartyName = thirdPartyConnector.name;
-    if (thirdPartyConnector.type) data.thirdPartyType = thirdPartyConnector.type;
-    if (thirdPartyConnector.protocol) data.thirdPartyProtocol = thirdPartyConnector.protocol;
-    if ("baseUrl" in thirdPartyConnector) data.thirdPartyBaseUrl = thirdPartyConnector.baseUrl || null;
-    if ("apiKey" in thirdPartyConnector) data.thirdPartyApiKey = thirdPartyConnector.apiKey || null;
-    if (thirdPartyConnector.status) data.thirdPartyStatus = thirdPartyConnector.status;
+    try {
+      if (thirdPartyConnector.disconnect) {
+        // "Desconectar": borra TODA la configuración saliente y sus secretos. (La clave de entrada
+        // del HCE se revoca aparte, generando una nueva.)
+        Object.assign(data, {
+          thirdPartyBaseUrl: null, thirdPartyApiKey: null, thirdPartyStatus: "No configurado", thirdPartyAuthType: "apikey",
+          thirdPartyTokenUrl: null, thirdPartyClientId: null, thirdPartyClientSecret: null, thirdPartyScope: "system/DiagnosticReport.write",
+        });
+      } else {
+        if (thirdPartyConnector.name) data.thirdPartyName = thirdPartyConnector.name;
+        if (thirdPartyConnector.type) data.thirdPartyType = thirdPartyConnector.type;
+        if (thirdPartyConnector.protocol) data.thirdPartyProtocol = thirdPartyConnector.protocol;
+        if ("baseUrl" in thirdPartyConnector) data.thirdPartyBaseUrl = thirdPartyConnector.baseUrl ? checkUrl(thirdPartyConnector.baseUrl, "URL base") : null;
+        if ("tokenUrl" in thirdPartyConnector) data.thirdPartyTokenUrl = thirdPartyConnector.tokenUrl ? checkUrl(thirdPartyConnector.tokenUrl, "URL del token") : null;
+        if (thirdPartyConnector.authType) {
+          if (!["apikey", "oauth2"].includes(thirdPartyConnector.authType)) return res.status(400).json({ error: "Tipo de autenticación no válido (apikey | oauth2)." });
+          data.thirdPartyAuthType = thirdPartyConnector.authType;
+        }
+        if ("clientId" in thirdPartyConnector) data.thirdPartyClientId = thirdPartyConnector.clientId?.trim() || null;
+        if (thirdPartyConnector.scope?.trim()) data.thirdPartyScope = thirdPartyConnector.scope.trim();
+        // Si el panel manda client id + secret sin indicar el tipo, se entiende que es OAuth2.
+        if (!thirdPartyConnector.authType && thirdPartyConnector.clientId && thirdPartyConnector.clientSecret) data.thirdPartyAuthType = "oauth2";
+        applySecret(data, "thirdPartyApiKey", thirdPartyConnector.apiKey);
+        applySecret(data, "thirdPartyClientSecret", thirdPartyConnector.clientSecret);
+        if (thirdPartyConnector.status) data.thirdPartyStatus = thirdPartyConnector.status;
+      }
+    } catch (err) {
+      return res.status(err.status || 400).json({ error: err.message });
+    }
   }
 
   const tenant = await prisma.tenant.update({ where: { id }, data });
-  await logAudit({ tenantId: id, userId: req.user.id, userName: req.user.name, action: "tenant.update", entityType: "Tenant", entityId: id, after: data });
-  res.json(tenant);
+  // En la auditoría NUNCA van los secretos, ni siquiera cifrados: solo qué campos cambiaron.
+  const { thirdPartyApiKey, thirdPartyClientSecret, ...auditable } = data;
+  await logAudit({ tenantId: id, userId: req.user.id, userName: req.user.name, action: "tenant.update", entityType: "Tenant", entityId: id, after: { ...auditable, ...(thirdPartyApiKey !== undefined ? { thirdPartyApiKey: "(actualizada)" } : {}), ...(thirdPartyClientSecret !== undefined ? { thirdPartyClientSecret: "(actualizado)" } : {}) } });
+  res.json(publicTenant(tenant));
 });
 
 // --- Usuarios ------------------------------------------------------------------
@@ -151,6 +203,54 @@ router.post("/tenants/:tenantId/integrations/simulate", async (req, res) => {
 
   await logAudit({ tenantId, userId: req.user.id, userName: req.user.name, action: "integration.simulate", entityType: "IntegrationMessage", entityId: message?.id, after: { kind } });
   res.json({ ok: true, message });
+});
+
+// --- Conexión con el sistema externo (HCE / Clinic-OS) ---------------------------------
+
+const tenantOr404 = async (req, res) => {
+  const tenant = await prisma.tenant.findUnique({ where: { id: req.params.tenantId } });
+  if (!tenant) res.status(404).json({ error: "Centro no encontrado." });
+  return tenant;
+};
+
+// Comprueba token + servidor FHIR sin enviar ningún dato clínico.
+router.post("/tenants/:tenantId/integrations/test", async (req, res) => {
+  if (!(await tenantOr404(req, res))) return;
+  const result = await testConnector(req.params.tenantId);
+  await logAudit({ tenantId: req.params.tenantId, userId: req.user.id, userName: req.user.name, action: "integration.test", entityType: "Tenant", entityId: req.params.tenantId, after: { ok: result.ok } });
+  res.json(result);
+});
+
+// Genera la clave que el HCE usará (X-API-Key) para ENVIAR órdenes a este centro. Se muestra una
+// única vez: en la base solo queda su hash, así que si se pierde se genera otra (y la anterior deja de valer).
+router.post("/tenants/:tenantId/integrations/inbound-key", async (req, res) => {
+  const tenant = await tenantOr404(req, res);
+  if (!tenant) return;
+  const apiKey = generateApiKey();
+  await prisma.tenant.update({ where: { id: tenant.id }, data: { inboundKeyHash: sha256Hex(apiKey) } });
+  await logAudit({ tenantId: tenant.id, userId: req.user.id, userName: req.user.name, action: "integration.inbound-key.generate", entityType: "Tenant", entityId: tenant.id });
+  const proto = req.get("x-forwarded-proto") || req.protocol;
+  const base = `${proto}://${req.get("host")}/api/fhir/tenants/${tenant.id}`;
+  res.json({ apiKey, tenantId: tenant.id, serviceRequestUrl: `${base}/ServiceRequest`, metadataUrl: `${base}/metadata`, header: "X-API-Key", note: "Cópiala ahora: no se vuelve a mostrar." });
+});
+
+// Reintento manual de un envío fallido (después de corregir la configuración, por ejemplo).
+router.post("/tenants/:tenantId/integrations/messages/:messageId/retry", async (req, res) => {
+  const msg = await prisma.integrationMessage.findFirst({ where: { id: req.params.messageId, tenantId: req.params.tenantId } });
+  if (!msg) return res.status(404).json({ error: "Mensaje no encontrado en este centro." });
+  const result = await retryIntegrationMessage(msg.id, { manual: true });
+  await logAudit({ tenantId: req.params.tenantId, userId: req.user.id, userName: req.user.name, action: "integration.retry", entityType: "IntegrationMessage", entityId: msg.id, after: { status: result.message?.status } });
+  if (!result.message) return res.status(409).json({ error: result.skipped });
+  res.json({ ok: result.message.status !== "failed", message: result.message });
+});
+
+// Envía (o reenvía) un informe ya publicado — útil para los publicados ANTES de configurar el conector.
+router.post("/tenants/:tenantId/integrations/reports/:reportId/send", async (req, res) => {
+  if (!(await tenantOr404(req, res))) return;
+  const result = await pushReportToConnector(req.params.tenantId, req.params.reportId, { force: true });
+  if (!result.message) return res.status(409).json({ error: result.skipped || "No se pudo enviar." });
+  await logAudit({ tenantId: req.params.tenantId, userId: req.user.id, userName: req.user.name, action: "integration.send-report", entityType: "DiagnosticReport", entityId: req.params.reportId, after: { status: result.message.status } });
+  res.json({ ok: result.message.status !== "failed", message: result.message });
 });
 
 export default router;

@@ -3,6 +3,7 @@ import bcrypt from "bcryptjs";
 import { prisma } from "../lib/prisma.js";
 import { authenticate, requireTenantUser } from "../middleware/auth.js";
 import { requirePermission, PERMISSIONS } from "../lib/permissions.js";
+import { pushReportToConnector } from "../lib/integration.js";
 
 const router = Router();
 router.use(authenticate, requireTenantUser);
@@ -14,17 +15,39 @@ const j = (v, fallback) => (v === undefined ? fallback : v);
 // existente y borra lo que ya no esté en la lista que mandó el navegador — así
 // la app puede seguir trabajando con arreglos en memoria, igual que antes con
 // localStorage, pero ahora todo queda guardado en Postgres.
-async function syncCollection(delegate, tenantId, items, buildData) {
+//
+// `protectedIds` (opcional) = ids que NO se pueden borrar aunque el navegador no los mande.
+// Sirve para lo que llega "desde afuera" mientras alguien tiene la app abierta (una orden que
+// envía el HCE, una reserva en línea): el navegador todavía no sabe que existe, y sin esta
+// protección su siguiente guardado automático la borraría.
+async function syncCollection(delegate, tenantId, items, buildData, protectedIds = new Set()) {
   const incoming = Array.isArray(items) ? items : [];
   const existing = await delegate.findMany({ where: { tenantId }, select: { id: true } });
   const existingIds = new Set(existing.map((e) => e.id));
   const incomingIds = new Set(incoming.map((i) => i.id));
-  const toDelete = [...existingIds].filter((id) => !incomingIds.has(id));
+  const toDelete = [...existingIds].filter((id) => !incomingIds.has(id) && !protectedIds.has(id));
   if (toDelete.length) await delegate.deleteMany({ where: { id: { in: toDelete }, tenantId } });
   for (const item of incoming) {
     const data = buildData(item);
     await delegate.upsert({ where: { id: item.id }, create: { id: item.id, tenantId, ...data }, update: data });
   }
+}
+
+// Ids que este servidor ya vio llegar desde el navegador (por USUARIO: lo que mandó otro
+// usuario del mismo centro no cuenta como "conocido" para esta sesión). Un registro creado
+// DESPUÉS de que el navegador cargó sus datos y que el navegador nunca mandó, lo creó otro
+// (HCE, reserva en línea): ese no se borra. Si el servidor se reinicia, el conjunto empieza
+// vacío y la protección por fecha (loadedAt) sigue cubriendo lo reciente.
+const seenByTenant = new Map(); // userId -> { patients, orders, appointments }
+const seenFor = (userId) => {
+  if (!seenByTenant.has(userId)) seenByTenant.set(userId, { patients: new Set(), orders: new Set(), appointments: new Set() });
+  return seenByTenant.get(userId);
+};
+const CLOCK_SKEW_MS = 60 * 1000; // margen por diferencias de reloj entre este servidor y la base
+
+async function newlyArrivedIds(delegate, tenantId, cutoff, seen) {
+  const rows = await delegate.findMany({ where: { tenantId, createdAt: { gt: cutoff } }, select: { id: true } });
+  return new Set(rows.map((r) => r.id).filter((id) => !seen.has(id)));
 }
 
 function publicUser(u) {
@@ -55,6 +78,7 @@ router.get("/", async (req, res) => {
   const tenantOut = tenant ? { id: tenant.id, name: tenant.name, kind: tenant.kind, plan: tenant.plan, hours: { open: tenant.hoursOpen, close: tenant.hoursClose } } : null;
 
   res.json({
+    serverTime: new Date().toISOString(), // el navegador lo devuelve como "loadedAt" al guardar
     tenant: tenantOut,
     users: users.map(publicUser),
     patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents,
@@ -65,8 +89,31 @@ router.get("/", async (req, res) => {
 router.put("/", async (req, res) => {
   const tenantId = req.user.tenantId;
   const body = req.body || {};
+  const reportsToSend = [];
 
   try {
+    // --- Protección de lo que llegó de afuera mientras el navegador tenía la app abierta ---
+    const loaded = body.loadedAt && !Number.isNaN(Date.parse(body.loadedAt)) ? new Date(body.loadedAt) : new Date(Date.now() - 30 * 60 * 1000);
+    const cutoff = new Date(loaded.getTime() - CLOCK_SKEW_MS);
+    const seen = seenFor(req.user.id);
+    const protectedPatients = body.patients ? await newlyArrivedIds(prisma.patient, tenantId, cutoff, seen.patients) : new Set();
+    const protectedOrders = body.orders ? await newlyArrivedIds(prisma.order, tenantId, cutoff, seen.orders) : new Set();
+    const protectedAppointments = body.appointments ? await newlyArrivedIds(prisma.appointment, tenantId, cutoff, seen.appointments) : new Set();
+    // Los estudios de una orden protegida también se protegen (si no, quedaría una orden sin estudios).
+    const protectedStudies = new Set();
+    if (body.studies && protectedOrders.size) {
+      const rows = await prisma.study.findMany({ where: { tenantId, orderId: { in: [...protectedOrders] } }, select: { id: true } });
+      rows.forEach((r) => protectedStudies.add(r.id));
+    }
+    for (const p of body.patients || []) seen.patients.add(p.id);
+    for (const o of body.orders || []) seen.orders.add(o.id);
+    for (const a of body.appointments || []) seen.appointments.add(a.id);
+
+    // Estado previo de los informes, para detectar cuáles pasan a "publicado" en este guardado.
+    const prevReports = body.diagnosticReports
+      ? new Map((await prisma.diagnosticReport.findMany({ where: { tenantId }, select: { id: true, status: true, version: true } })).map((r) => [r.id, r]))
+      : new Map();
+
     if (body.hours) {
       await prisma.tenant.update({ where: { id: tenantId }, data: { hoursOpen: body.hours.open, hoursClose: body.hours.close } });
     }
@@ -101,7 +148,7 @@ router.put("/", async (req, res) => {
         birthDate: p.birthDate || null, sex: p.sex || null, externalIdentifiers: j(p.externalIdentifiers, []),
         sourceSystem: p.sourceSystem || null, sourcePatientId: p.sourcePatientId || null, matchStatus: p.matchStatus || "confirmado",
         createdAt: d(p.createdAt) || undefined,
-      }));
+      }), protectedPatients);
     }
 
     if (body.orders) {
@@ -112,7 +159,7 @@ router.put("/", async (req, res) => {
         reason: o.reason || "", presumptiveDiagnosis: o.presumptiveDiagnosis || "", priority: o.priority || "rutina", notes: o.notes || "",
         status: o.status || "active", createdAt: d(o.createdAt) || undefined, scheduledAt: d(o.scheduledAt), receivedAt: d(o.receivedAt), completedAt: d(o.completedAt),
         convenioId: o.convenioId || null, convenioName: o.convenioName || "Particular", totalAmount: Number(o.totalAmount) || 0, paidAmount: Number(o.paidAmount) || 0,
-      }));
+      }), protectedOrders);
     }
 
     if (body.studies) {
@@ -122,7 +169,7 @@ router.put("/", async (req, res) => {
         scheduledAt: d(s.scheduledAt) || undefined, startedAt: d(s.startedAt), completedAt: d(s.completedAt),
         externalStudyId: s.externalStudyId || null, bodySite: s.bodySite || "", laterality: s.laterality || "", technique: s.technique || "",
         accessionNumber: s.accessionNumber || null, studyInstanceUID: s.studyInstanceUID || null, specimenId: s.specimenId || null, reportId: s.reportId || null,
-      }));
+      }), protectedStudies);
     }
 
     if (body.specimens) {
@@ -149,6 +196,15 @@ router.put("/", async (req, res) => {
         resultIds: j(rep.resultIds, []), version: rep.version || 1, amendmentReason: rep.amendmentReason || "", pdfRef: rep.pdfRef || null,
         createdAt: d(rep.createdAt) || undefined, validatedAt: d(rep.validatedAt), publishedAt: d(rep.publishedAt),
       }));
+
+      // Un informe "se publicó" cuando pasa a published, o cuando ya estaba publicado y sube de
+      // versión (corrección republicada). Eso dispara el envío al sistema conectado. Un informe
+      // en estado "amended" (corrección en curso) NO se envía todavía.
+      for (const rep of body.diagnosticReports) {
+        if (rep.status !== "published") continue;
+        const prev = prevReports.get(rep.id);
+        if (!prev || prev.status !== "published" || (rep.version || 1) > (prev.version || 1)) reportsToSend.push(rep.id);
+      }
     }
 
     if (body.catalog) {
@@ -162,15 +218,25 @@ router.put("/", async (req, res) => {
       await syncCollection(prisma.appointment, tenantId, body.appointments, (a) => ({
         patientName: a.patientName, documentNumber: a.documentNumber || "", serviceCode: a.serviceCode, serviceName: a.serviceName,
         modality: a.modality, scheduledAt: d(a.scheduledAt) || new Date(), source: a.source || "Reserva en línea",
-      }));
+      }), protectedAppointments);
     }
 
     if (body.integrationMessages) {
-      await syncCollection(prisma.integrationMessage, tenantId, body.integrationMessages, (m) => ({
-        eventId: m.eventId, correlationId: m.correlationId, type: m.type, direction: m.direction, source: m.source,
-        destination: m.destination, status: m.status || "pending", payloadSummary: m.payloadSummary || "", attempts: m.attempts || 1,
-        createdAt: d(m.createdAt) || undefined,
-      }));
+      // Los mensajes de integración los gestiona el SERVIDOR (estado, intentos, reintentos). El
+      // navegador solo puede agregar los que invente él (simulador de demostración); nunca borrar
+      // ni sobrescribir los reales — antes un guardado con una lista vieja los borraba o los
+      // devolvía a un estado anterior.
+      for (const m of body.integrationMessages) {
+        await prisma.integrationMessage.upsert({
+          where: { id: m.id },
+          create: {
+            id: m.id, tenantId, eventId: m.eventId || undefined, correlationId: m.correlationId || undefined, type: m.type, direction: m.direction,
+            source: m.source, destination: m.destination, status: m.status || "pending", payloadSummary: m.payloadSummary || "", attempts: m.attempts || 1,
+            createdAt: d(m.createdAt) || undefined,
+          },
+          update: {},
+        });
+      }
     }
 
     if (body.auditEvents) {
@@ -220,6 +286,15 @@ router.put("/", async (req, res) => {
     }
 
     res.json({ ok: true });
+
+    // Después de responder: así el guardado del navegador no espera a la red del sistema externo.
+    if (reportsToSend.length) {
+      (async () => {
+        for (const reportId of reportsToSend) {
+          try { await pushReportToConnector(tenantId, reportId); } catch (err) { console.error("[integración] envío del informe", reportId, err.message); }
+        }
+      })();
+    }
   } catch (err) {
     res.status(err.status || 500).json({ error: err.message });
   }

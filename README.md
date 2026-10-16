@@ -156,3 +156,9 @@ El frontend todavía lee/escribe en `localStorage` (`src/lib/storage.js`). El
 siguiente paso es crear `src/lib/api.js` para que hable con esta API usando el
 token de `/api/auth/login` (o `/api/auth/admin-login` en `admin.html`). Dime
 cuándo quieres que lo arme.
+
+
+## Conexión con Clinic-OS (HCE)
+
+Ver [`docs/INTEGRACION_CLINIC-OS.md`](docs/INTEGRACION_CLINIC-OS.md): contrato completo, configuración paso a paso y variables de entorno.
+Las pruebas (`npm test`) levantan un Clinic-OS simulado y cubren el ciclo orden → estudio → informe → entrega con reintentos.

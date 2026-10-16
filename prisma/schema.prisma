@@ -51,8 +51,22 @@ model Tenant {
   thirdPartyType     String  @default("HIS / LIS / RIS / PACS")
   thirdPartyProtocol String  @default("A definir por contrato")
   thirdPartyBaseUrl  String?
+  // Clave estática. Se guarda CIFRADA (ver src/lib/secrets.js). Sirve para: (a) autenticar
+  // llamadas salientes cuando thirdPartyAuthType = "apikey", y (b) por compatibilidad, como clave
+  // de entrada (X-API-Key) si el centro todavía no tiene inboundKeyHash.
   thirdPartyApiKey   String?
   thirdPartyStatus   String  @default("No configurado") // No configurado | Conectado
+
+  // Autenticación SALIENTE (Diagnostic OS -> sistema externo): "apikey" | "oauth2"
+  thirdPartyAuthType     String  @default("apikey")
+  thirdPartyTokenUrl     String? // si va vacío se usa {baseUrl}/oauth/token
+  thirdPartyClientId     String?
+  thirdPartyClientSecret String? // cifrado
+  thirdPartyScope        String  @default("system/DiagnosticReport.write")
+
+  // Autenticación ENTRANTE (sistema externo -> Diagnostic OS, X-API-Key). Solo se guarda el
+  // hash SHA-256: la clave en claro se muestra una única vez al generarla.
+  inboundKeyHash String?
 
   createdAt DateTime @default(now())
 
@@ -148,6 +162,7 @@ model Order {
   reports DiagnosticReport[]
 
   @@index([tenantId])
+  @@index([tenantId, externalOrderId])
 }
 
 model Study {
@@ -311,10 +326,17 @@ model IntegrationMessage {
   payloadSummary String @default("")
   attempts      Int     @default(1)
 
+  // Para poder reintentar un envío saliente: qué se mandó, por qué falló y cuándo reintentar.
+  entityType  String? // "DiagnosticReport"
+  entityId    String?
+  lastError   String?
+  nextRetryAt DateTime?
+
   createdAt DateTime @default(now())
   updatedAt DateTime @updatedAt
 
   @@index([tenantId])
+  @@index([status, nextRetryAt])
 }
 
 model AuditEvent {
