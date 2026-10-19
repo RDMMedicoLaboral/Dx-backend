@@ -9,9 +9,9 @@
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma db push",
     "prisma:migrate:dev": "prisma migrate dev",
-    "seed": "node prisma/seed.js",
     "build": "prisma generate && prisma db push",
-    "test": "node --import ./tests/register.mjs --test --test-timeout=60000 tests/*.test.mjs"
+    "test": "node --import ./tests/register.mjs --test --test-timeout=60000 tests/*.test.mjs",
+    "create-admin": "node prisma/create-admin.js"
   },
   "dependencies": {
     "@prisma/client": "^5.19.1",

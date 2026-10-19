@@ -66,7 +66,6 @@ test("informe saliente: autocontenido, con cédula, Observations, orden original
   // vínculo con la orden original (la que envió Clinic-OS), no con el id interno
   assert.equal(dr.basedOn[0].identifier.value, "LO-1001");
   assert.equal(dr.basedOn[0].identifier.system, "urn:clinicos:lab-order");
-  assert.equal(dr.basedOn[0].reference, "ServiceRequest/LO-1001");
   // valores del examen
   const obs = dr.contained.filter((c) => c.resourceType === "Observation");
   assert.equal(obs.length, 4);
@@ -85,6 +84,13 @@ test("informe saliente: autocontenido, con cédula, Observations, orden original
   assert.equal(dr._diagnosticOs, undefined, "sin claves no-FHIR");
   // todo contenido tiene id local y es serializable
   assert.doesNotThrow(() => JSON.stringify(dr));
+});
+
+test("externalSystemOf: se devuelve el 'system' que envió la clínica; en órdenes antiguas, el sourceSystem si parece URN", () => {
+  assert.equal(F.externalSystemOf({ externalSystem: "urn:rdm:orden", sourceSystem: "Clínica RDM" }), "urn:rdm:orden");
+  assert.equal(F.externalSystemOf({ sourceSystem: "urn:clinicos:lab-order" }), "urn:clinicos:lab-order");
+  assert.equal(F.externalSystemOf({ sourceSystem: "HCE" }), null);
+  assert.equal(F.externalSystemOf({ sourceSystem: "Clínica RDM" }), null);
 });
 
 test("informe: una versión 2 publicada sale como 'amended'; sin orden externa usa el id interno", () => {

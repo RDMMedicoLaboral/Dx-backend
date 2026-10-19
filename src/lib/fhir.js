@@ -27,6 +27,17 @@ export const SYSTEMS = {
   extFindings: "urn:diagnostic-os:StructureDefinition/findings",
 };
 
+/**
+ * "system" del identificador con que la clínica nombró la orden. Se devuelve IDÉNTICO en el informe
+ * (basedOn) para que la clínica reconozca su orden, sea cual sea el formato que use (incluso si
+ * incluye el id de la clínica). Órdenes antiguas: se usa sourceSystem si parecía un URN/URL.
+ */
+export function externalSystemOf(order) {
+  if (order?.externalSystem) return order.externalSystem;
+  if (order?.sourceSystem && /[:/]/.test(order.sourceSystem)) return order.sourceSystem;
+  return null;
+}
+
 const isNumeric = (v) => /^-?\d+([.,]\d+)?$/.test(String(v ?? "").trim());
 const toNumber = (v) => Number(String(v).trim().replace(",", "."));
 const esc = (s) => String(s ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
@@ -75,7 +86,7 @@ export function orderToServiceRequest(order, study) {
   return {
     resourceType: "ServiceRequest",
     id: order.id,
-    identifier: order.externalOrderId ? [{ system: order.sourceSystem || "external", value: order.externalOrderId }] : undefined,
+    identifier: order.externalOrderId ? [{ ...(externalSystemOf(order) ? { system: externalSystemOf(order) } : {}), value: order.externalOrderId }] : undefined,
     status: order.status === "completed" ? "completed" : order.status === "cancelled" ? "revoked" : "active",
     intent: "order",
     priority: order.priority === "emergencia" ? "stat" : order.priority === "urgente" ? "urgent" : order.priority === "prioritaria" ? "asap" : "routine",
@@ -138,11 +149,8 @@ function attachmentContentType(a) {
 export function basedOnFor(order, study) {
   const externalValue = study?.externalStudyId || order?.externalOrderId || null;
   if (externalValue) {
-    return [{
-      type: "ServiceRequest",
-      reference: `ServiceRequest/${externalValue}`,
-      identifier: { ...(order?.sourceSystem ? { system: order.sourceSystem } : {}), value: externalValue },
-    }];
+    const system = externalSystemOf(order);
+    return [{ type: "ServiceRequest", identifier: { ...(system ? { system } : {}), value: externalValue } }];
   }
   return order ? [{ type: "ServiceRequest", identifier: { system: SYSTEMS.dxOrder, value: order.id } }] : undefined;
 }
@@ -220,6 +228,7 @@ export function serviceRequestToOrderInput(resource) {
     externalOrderId: ident?.value || resource.id || null,
     requisitionId: requisition,
     sourceSystem: ident?.system || "HCE",
+    externalSystem: ident?.system || null, // tal cual lo envió la clínica
     reason: resource.reasonCode?.[0]?.text || resource.reasonCode?.[0]?.coding?.[0]?.display || "",
     priority: resource.priority === "stat" ? "emergencia" : resource.priority === "urgent" ? "urgente" : resource.priority === "asap" ? "prioritaria" : "rutina",
     requestingPractitioner: resource.requester?.display ? { name: resource.requester.display } : null,

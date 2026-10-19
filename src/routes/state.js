@@ -56,7 +56,7 @@ function publicUser(u) {
 
 router.get("/", async (req, res) => {
   const tenantId = req.user.tenantId;
-  const [tenant, users, patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents, convenios, quotes, cashSessions, cashMovements] = await Promise.all([
+  const [tenant, users, patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents, convenios, quotes, cashSessions, cashMovements, connections] = await Promise.all([
     prisma.tenant.findUnique({ where: { id: tenantId } }),
     prisma.user.findMany({ where: { tenantId } }),
     prisma.patient.findMany({ where: { tenantId } }),
@@ -73,12 +73,15 @@ router.get("/", async (req, res) => {
     prisma.quote.findMany({ where: { tenantId }, orderBy: { createdAt: "desc" } }),
     prisma.cashSession.findMany({ where: { tenantId }, orderBy: { openedAt: "desc" }, take: 30 }),
     prisma.cashMovement.findMany({ where: { tenantId }, orderBy: { createdAt: "desc" }, take: 500 }),
+    prisma.connection.findMany({ where: { tenantId }, orderBy: { createdAt: "asc" } }),
   ]);
 
   const tenantOut = tenant ? { id: tenant.id, name: tenant.name, kind: tenant.kind, plan: tenant.plan, hours: { open: tenant.hoursOpen, close: tenant.hoursClose } } : null;
 
   res.json({
     serverTime: new Date().toISOString(), // el navegador lo devuelve como "loadedAt" al guardar
+    // Las clínicas conectadas a este centro (solo nombre y estado: la configuración y las claves son del administrador).
+    connections: connections.map((c) => ({ id: c.id, name: c.name, enabled: c.enabled !== false })),
     tenant: tenantOut,
     users: users.map(publicUser),
     patients, orders, studies, specimens, results, diagnosticReports, catalog, appointments, integrationMessages, auditEvents,
@@ -145,7 +148,7 @@ router.put("/", async (req, res) => {
     if (body.patients) {
       await syncCollection(prisma.patient, tenantId, body.patients, (p) => ({
         firstName: p.firstName, lastName: p.lastName, documentType: p.documentType || "cedula", documentNumber: p.documentNumber,
-        birthDate: p.birthDate || null, sex: p.sex || null, externalIdentifiers: j(p.externalIdentifiers, []),
+        birthDate: p.birthDate || null, sex: p.sex || null, // externalIdentifiers lo gestiona el servidor (identificadores por clínica): el navegador no lo sobrescribe
         sourceSystem: p.sourceSystem || null, sourcePatientId: p.sourcePatientId || null, matchStatus: p.matchStatus || "confirmado",
         createdAt: d(p.createdAt) || undefined,
       }), protectedPatients);
@@ -223,7 +226,7 @@ router.put("/", async (req, res) => {
 
     if (body.integrationMessages) {
       // Los mensajes de integración los gestiona el SERVIDOR (estado, intentos, reintentos). El
-      // navegador solo puede agregar los que invente él (simulador de demostración); nunca borrar
+      // navegador solo puede agregar los suyos (p. ej. el registro de una cita importada desde la reserva en línea); nunca borrar
       // ni sobrescribir los reales — antes un guardado con una lista vieja los borraba o los
       // devolvía a un estado anterior.
       for (const m of body.integrationMessages) {

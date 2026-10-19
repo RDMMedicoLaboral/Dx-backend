@@ -6,8 +6,7 @@ const integration = createIntegration({ db: prisma });
 
 export const pushReportToConnector = (tenantId, reportId, opts) => integration.pushReport(tenantId, reportId, opts);
 export const retryIntegrationMessage = (messageId, opts) => integration.retryMessage(messageId, opts);
-export const testConnector = (tenantId) => integration.testConnection(tenantId);
-export const connectorOf = integration.connectorOf;
+export const testConnector = (tenantId, connectionId) => integration.testConnection(tenantId, connectionId);
 
 // Reintento automático de envíos fallidos. En el plan gratuito de Render el servicio se duerme
 // tras 15 min sin tráfico: al despertar, este temporizador retoma lo pendiente.

@@ -1,3 +1,12 @@
+/**
+ * El paciente del laboratorio puede ser también paciente de VARIAS clínicas. Los identificadores que cada
+ * clínica puso en su ficha (sus propios ids internos) son privados de esa clínica: a una clínica solo se le
+ * muestran los suyos. Los que no estén marcados con una conexión no se muestran a nadie fuera del laboratorio.
+ */
+export function identifiersVisibleTo(list, connectionId) {
+  return (Array.isArray(list) ? list : []).filter((ei) => ei && ei.connectionId && ei.connectionId === connectionId);
+}
+
 // Junta todo lo que hace falta para armar un DiagnosticReport autocontenido:
 // orden, estudio, paciente (con cédula), resultados de laboratorio y archivos adjuntos.
 export async function loadReportContext(db, report) {
@@ -11,6 +20,9 @@ export async function loadReportContext(db, report) {
       orderBy: { createdAt: "asc" },
     }),
   ]);
+
+  // Lo que sale hacia una clínica nunca lleva datos de otras clínicas.
+  if (patient) patient.externalIdentifiers = identifiersVisibleTo(patient.externalIdentifiers, order?.connectionId);
 
   let results = [];
   if (report.type === "LAB") {

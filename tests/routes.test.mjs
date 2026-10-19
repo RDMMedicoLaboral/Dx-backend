@@ -15,7 +15,7 @@ const fhirRoutes = (await import("../src/routes/fhir.js")).default;
 const stateRoutes = (await import("../src/routes/state.js")).default;
 const clinicalRoutes = (await import("../src/routes/clinical.js")).default;
 
-let server, base, clinic, adminTok, ownerTok, inboundKey;
+let server, base, clinic, adminTok, ownerTok, inboundKey, connId;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 async function until(fn, ms = 4000) { const t = Date.now(); while (Date.now() - t < ms) { const v = await fn(); if (v) return v; await sleep(25); } throw new Error("timeout esperando condición"); }
 
@@ -49,49 +49,62 @@ before(async () => {
 });
 after(async () => { server?.closeAllConnections?.(); await new Promise((r) => server.close(r)); await clinic.close(); });
 
-test("admin: configura OAuth; los secretos se guardan cifrados y NUNCA se devuelven", async () => {
-  const r = await call("PATCH", "/api/admin/tenants/t1", { token: adminTok, body: { thirdPartyConnector: { name: "Clinic-OS", baseUrl: clinic.baseUrl, authType: "oauth2", clientId: clinic.clientId, clientSecret: clinic.clientSecret, scope: "system/DiagnosticReport.write", apiKey: "otra-clave", status: "Conectado" } } });
+test("admin: crea la conexión con una clínica y configura su retorno (OAuth); secretos cifrados y NUNCA devueltos", async () => {
+  const created = await call("POST", "/api/admin/tenants/t1/connections", { token: adminTok, body: { name: "Clínica RDM", type: "HCE" } });
+  assert.equal(created.status, 201);
+  connId = created.body.id;
+  assert.equal(created.body.inboundKeySet, false);
+
+  const r = await call("PATCH", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok, body: { baseUrl: clinic.baseUrl, authType: "oauth2", clientId: clinic.clientId, clientSecret: clinic.clientSecret, scope: "system/DiagnosticReport.write", apiKey: "otra-clave" } });
   assert.equal(r.status, 200);
-  assert.equal(r.body.thirdPartyClientSecret, undefined);
-  assert.equal(r.body.thirdPartyApiKey, undefined);
-  assert.equal(r.body.thirdPartyClientSecretSet, true);
-  assert.equal(r.body.thirdPartyAuthType, "oauth2");
-  const row = await db.tenant.findUnique({ where: { id: "t1" } });
-  assert.ok(isEncrypted(row.thirdPartyClientSecret) && isEncrypted(row.thirdPartyApiKey));
+  assert.equal(r.body.clientSecret, undefined);
+  assert.equal(r.body.apiKey, undefined);
+  assert.equal(r.body.clientSecretSet, true);
+  assert.equal(r.body.authType, "oauth2");
+  const row = db.connection._rows.find((c) => c.id === connId);
+  assert.ok(isEncrypted(row.clientSecret) && isEncrypted(row.apiKey));
   assert.ok(!JSON.stringify(await db.auditEvent.findMany({})).includes(clinic.clientSecret), "el secreto no queda en la auditoría");
 
-  const list = await call("GET", "/api/admin/tenants", { token: adminTok });
+  const list = await call("GET", "/api/admin/tenants/t1/connections", { token: adminTok });
   assert.ok(!JSON.stringify(list.body).includes(clinic.clientSecret));
-  assert.equal(list.body[0].thirdPartyClientSecretSet, true);
+  assert.equal(list.body[0].clientSecretSet, true);
 
   // guardar de nuevo sin tocar el secreto (el panel manda vacío) NO lo borra
-  await call("PATCH", "/api/admin/tenants/t1", { token: adminTok, body: { thirdPartyConnector: { clientSecret: "" } } });
-  assert.ok((await db.tenant.findUnique({ where: { id: "t1" } })).thirdPartyClientSecret);
+  await call("PATCH", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok, body: { clientSecret: "" } });
+  assert.ok(db.connection._rows.find((c) => c.id === connId).clientSecret);
 });
 
-test("admin: valida las URLs del conector", async () => {
-  const bad = await call("PATCH", "/api/admin/tenants/t1", { token: adminTok, body: { thirdPartyConnector: { baseUrl: "no-es-url" } } });
+test("admin: nombre obligatorio y sin repetir dentro del mismo centro", async () => {
+  assert.equal((await call("POST", "/api/admin/tenants/t1/connections", { token: adminTok, body: { name: " " } })).status, 400);
+  assert.equal((await call("POST", "/api/admin/tenants/t1/connections", { token: adminTok, body: { name: "clínica rdm" } })).status, 409);
+  assert.equal((await call("POST", "/api/admin/tenants/NOEXISTE/connections", { token: adminTok, body: { name: "X" } })).status, 404);
+});
+
+test("admin: valida las URLs de la conexión", async () => {
+  const bad = await call("PATCH", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok, body: { baseUrl: "no-es-url" } });
   assert.equal(bad.status, 400);
-  const creds = await call("PATCH", "/api/admin/tenants/t1", { token: adminTok, body: { thirdPartyConnector: { baseUrl: "https://user:pass@host.com/x" } } });
+  const creds = await call("PATCH", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok, body: { baseUrl: "https://user:pass@host.com/x" } });
   assert.equal(creds.status, 400);
-  assert.equal((await db.tenant.findUnique({ where: { id: "t1" } })).thirdPartyBaseUrl, clinic.baseUrl, "no se tocó");
+  assert.equal(db.connection._rows.find((c) => c.id === connId).baseUrl, clinic.baseUrl, "no se tocó");
 });
 
 test("admin: probar conexión", async () => {
-  const r = await call("POST", "/api/admin/tenants/t1/integrations/test", { token: adminTok });
+  const r = await call("POST", `/api/admin/tenants/t1/connections/${connId}/test`, { token: adminTok });
   assert.equal(r.status, 200);
   assert.equal(r.body.ok, true, JSON.stringify(r.body));
-  // un usuario de centro no puede
-  assert.equal((await call("POST", "/api/admin/tenants/t1/integrations/test", { token: ownerTok })).status, 403);
+  assert.equal((await call("POST", `/api/admin/tenants/t1/connections/${connId}/test`, { token: ownerTok })).status, 403, "un usuario de centro no puede");
+  assert.equal((await call("POST", `/api/admin/tenants/OTRO/connections/${connId}/test`, { token: adminTok })).status, 404, "no cruza centros");
 });
 
-test("admin: genera la clave de entrada una sola vez y solo guarda su hash", async () => {
-  const r = await call("POST", "/api/admin/tenants/t1/integrations/inbound-key", { token: adminTok });
+test("admin: genera la clave de entrada de ESA clínica una sola vez y solo guarda su hash", async () => {
+  const r = await call("POST", `/api/admin/tenants/t1/connections/${connId}/inbound-key`, { token: adminTok });
   assert.equal(r.status, 200);
   inboundKey = r.body.apiKey;
   assert.match(inboundKey, /^dosk_/);
+  assert.equal(r.body.connectionName, "Clínica RDM");
+  assert.match(r.body.fhirBaseUrl, /\/api\/fhir\/tenants\/t1$/, "la URL que se le entrega a la clínica");
   assert.match(r.body.serviceRequestUrl, /\/api\/fhir\/tenants\/t1\/ServiceRequest$/);
-  const row = await db.tenant.findUnique({ where: { id: "t1" } });
+  const row = db.connection._rows.find((c) => c.id === connId);
   assert.equal(row.inboundKeyHash.length, 64);
   assert.ok(!JSON.stringify(row).includes(inboundKey));
 });
@@ -120,13 +133,16 @@ test("FHIR entrada: crea orden + ESTUDIO del catálogo (emparejado por LOINC) + 
   assert.equal(study.externalStudyId, "LO-1001");
   const order = db.order._rows.find((o) => o.id === ids.orderId);
   assert.equal(order.externalOrderId, "LO-1001");
-  assert.equal(order.sourceSystem, "urn:clinicos:lab-order");
   assert.equal(order.sourceType, "HCE");
+  assert.equal(order.connectionId, connId, "la orden queda marcada con la conexión (clínica) que la envió");
+  assert.equal(order.sourceSystem, "Clínica RDM");
+  assert.equal(order.externalSystem, "urn:clinicos:lab-order", "el system se guarda tal cual lo envió la clínica");
   const pat = db.patient._rows.find((p) => p.id === ids.patientId);
   assert.equal(pat.documentNumber, "0912345678", "tomó la cédula aunque no fuera el primer identificador");
   assert.equal(pat.matchStatus, "pendiente");
   assert.equal(pat.sourcePatientId, "clinicos-pat-77");
-  assert.deepEqual(pat.externalIdentifiers, [{ system: "urn:clinicos:patient", value: "77", type: "externo" }]);
+  assert.equal(pat.sourceSystem, "Clínica RDM");
+  assert.deepEqual(pat.externalIdentifiers.map((e) => [e.system, e.value, e.connectionId]), [["urn:clinicos:patient", "77", connId], [`urn:diagnostic-os:connection:${connId}`, "clinicos-pat-77", connId]], "identificadores de la clínica, marcados con su conexión");
 });
 
 test("FHIR entrada: reenviar la misma orden NO la duplica (idempotente)", async () => {
@@ -170,13 +186,22 @@ test("FHIR entrada: errores claros (sin paciente / recurso equivocado) y anulaci
   assert.equal(db.order._rows.find((o) => o.externalOrderId === "LO-1002").status, "cancelled");
 });
 
-test("FHIR entrada: clave 'legada' (centro viejo sin hash) sigue funcionando", async () => {
-  await db.tenant.create({ data: { id: "t-old", name: "Viejo", thirdPartyApiKey: "clave-antigua-en-claro" } });
+test("FHIR entrada: un centro configurado con la versión anterior (una sola clave) se migra solo y su clave sigue valiendo", async () => {
+  await db.tenant.create({ data: { id: "t-old", name: "Viejo", thirdPartyName: "Clinic-OS", thirdPartyApiKey: "clave-antigua-en-claro" } });
+  await db.patient.create({ data: { id: "p-old", tenantId: "t-old", firstName: "A", lastName: "B", documentNumber: "55", externalIdentifiers: [{ system: "urn:x", value: "9" }] } });
+  await db.order.create({ data: { id: "o-old", tenantId: "t-old", patientId: "p-old", sourceType: "HCE", externalOrderId: "7" } });
+  assert.equal((await call("GET", "/api/fhir/tenants/t-old/metadata", { headers: { "X-API-Key": "mala" } })).status, 401);
   const ok = await call("GET", "/api/fhir/tenants/t-old/metadata", { headers: { "X-API-Key": "clave-antigua-en-claro" } });
   assert.equal(ok.status, 200);
-  await db.tenant.update({ where: { id: "t-old" }, data: { thirdPartyApiKey: encryptSecret("clave-nueva") } });
-  assert.equal((await call("GET", "/api/fhir/tenants/t-old/metadata", { headers: { "X-API-Key": "clave-nueva" } })).status, 200);
-  assert.equal((await call("GET", "/api/fhir/tenants/t-old/metadata", { headers: { "X-API-Key": "otra" } })).status, 401);
+  assert.match(ok.body.implementation.description, /Viejo · conexión "Clinic-OS"/);
+  const conns = db.connection._rows.filter((c) => c.tenantId === "t-old");
+  assert.equal(conns.length, 1, "se creó UNA conexión");
+  assert.equal(db.order._rows.find((o) => o.id === "o-old").connectionId, conns[0].id, "sus órdenes quedaron marcadas");
+  assert.equal(db.patient._rows.find((p) => p.id === "p-old").externalIdentifiers[0].connectionId, conns[0].id, "y los ids de sus pacientes también");
+  const t = db.tenant._rows.find((x) => x.id === "t-old");
+  assert.equal(t.thirdPartyApiKey, null, "los secretos antiguos ya no quedan en el centro");
+  assert.equal((await call("GET", "/api/fhir/tenants/t-old/metadata", { headers: { "X-API-Key": "clave-antigua-en-claro" } })).status, 200, "la misma clave sigue funcionando");
+  assert.equal(db.connection._rows.filter((c) => c.tenantId === "t-old").length, 1, "idempotente");
 });
 
 // ------------------------ ciclo completo desde la app (estado) ---------------------------------
@@ -283,13 +308,23 @@ test("admin: reintentar un mensaje fallido a mano", async () => {
   assert.equal((await call("POST", `/api/admin/tenants/OTRO/integrations/messages/${failed.id}/retry`, { token: adminTok })).status, 404, "no cruza centros");
 });
 
-test("admin: desconectar borra TODOS los secretos de salida", async () => {
-  const r = await call("PATCH", "/api/admin/tenants/t1", { token: adminTok, body: { thirdPartyConnector: { disconnect: true } } });
+test("admin: quitar el destino de retorno borra TODOS los secretos de salida (la clave de entrada se cambia aparte)", async () => {
+  const r = await call("PATCH", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok, body: { disconnect: true } });
   assert.equal(r.status, 200);
-  const row = await db.tenant.findUnique({ where: { id: "t1" } });
-  assert.equal(row.thirdPartyBaseUrl, null);
-  assert.equal(row.thirdPartyClientSecret, null);
-  assert.equal(row.thirdPartyApiKey, null);
-  assert.equal(row.thirdPartyStatus, "No configurado");
-  assert.ok(row.inboundKeyHash, "la clave de entrada se revoca generando otra, no al desconectar");
+  const row = db.connection._rows.find((c) => c.id === connId);
+  assert.equal(row.baseUrl, null);
+  assert.equal(row.clientSecret, null);
+  assert.equal(row.apiKey, null);
+  assert.ok(row.inboundKeyHash, "la clave de entrada se revoca generando otra, no al quitar el retorno");
+});
+
+test("admin: una conexión con órdenes no se puede eliminar (solo desactivar); una vacía sí", async () => {
+  const del = await call("DELETE", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok });
+  assert.equal(del.status, 409);
+  assert.match(del.body.error, /Desactívala/);
+  const off = await call("PATCH", `/api/admin/tenants/t1/connections/${connId}`, { token: adminTok, body: { enabled: false } });
+  assert.equal(off.body.enabled, false);
+  assert.equal((await call("POST", "/api/fhir/tenants/t1/ServiceRequest", { body: serviceRequest("LO-9"), headers: { "X-API-Key": inboundKey } })).status, 403, "desactivada: la clínica ya no puede enviar");
+  const tmp = await call("POST", "/api/admin/tenants/t1/connections", { token: adminTok, body: { name: "Temporal" } });
+  assert.equal((await call("DELETE", `/api/admin/tenants/t1/connections/${tmp.body.id}`, { token: adminTok })).status, 200);
 });

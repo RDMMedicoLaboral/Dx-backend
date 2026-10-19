@@ -56,29 +56,27 @@ pantalla — solo cambiar de dónde vienen los datos.
    | `CLOUDINARY_CLOUD_NAME` | del paso 2 (ojo con el nombre exacto de la variable) |
    | `CLOUDINARY_API_KEY` | del paso 2 |
    | `CLOUDINARY_API_SECRET` | del paso 2 |
-   | `SEED_KEY` | clic en "Generate" — la usarás en el paso 4 |
+   | `ADMIN_EMAIL` | el correo con el que entrarás al panel de administrador (paso 4) |
+   | `ADMIN_PASSWORD` | una contraseña larga y única (mínimo 12 caracteres) |
+   | `INTEGRATION_ENC_KEY` | clic en "Generate" — cifra los secretos de las integraciones |
    | `NODE_ENV` | `production` |
 6. Clic en **Create Web Service**. Render instala, compila y crea las tablas automáticamente (el build command incluye `prisma migrate deploy`). Tarda 2-5 minutos — puedes ver el progreso en la pestaña **Logs**.
 
-### 4. Cargar los datos de demostración (sin usar Shell)
+### 4. Crear el administrador de plataforma
 
-El plan gratuito de Render **no incluye acceso a Shell** (te pide upgrade). Para
-esto agregamos una URL especial que hace lo mismo:
+No hay datos ni cuentas de demostración: el sistema arranca **vacío**. El administrador se crea solo,
+al arrancar el servidor, con las variables `ADMIN_EMAIL` y `ADMIN_PASSWORD` del paso anterior
+(en los Logs verás `Administrador de plataforma creado`). La contraseña no se guarda en ningún
+archivo ni se muestra por HTTP.
 
-1. Copia el valor de `SEED_KEY` que generaste (Render → tu servicio → **Environment** → clic en el ojito junto a `SEED_KEY`).
-2. Con el deploy ya en verde ("Live"), abre en el navegador:
-   ```
-   https://TU-SERVICIO.onrender.com/api/dev/seed?key=TU_SEED_KEY
-   ```
-   (reemplaza `TU-SERVICIO` por el nombre real que te dio Render, y `TU_SEED_KEY` por el valor copiado).
-3. Deberías ver un JSON como:
-   ```json
-   { "ok": true, "message": "Datos de demostración cargados.", "credenciales": { ... } }
-   ```
-   Puedes visitar esa URL más de una vez sin problema — no duplica nada.
+- **Cambiar la contraseña del administrador:** cambia el valor de `ADMIN_PASSWORD` en Render y reinicia el servicio.
+- **Desde tu computadora:** `ADMIN_EMAIL=... ADMIN_PASSWORD=... npm run create-admin`.
+- Después entra a `admin.html` con ese correo y crea los centros y sus usuarios desde el panel.
 
-> **Seguridad:** esta ruta solo funciona si conoces `SEED_KEY`, así que es segura mientras no compartas esa clave. Aun así, una vez que ya no la necesites, puedes borrar el archivo `src/routes/dev.js` (y su línea en `src/index.js`) y volver a subir el repo.
-
+> **Si vienes de una versión anterior** que sembraba cuentas de demostración (`soporte@diagnosticos.app`,
+> `*.demo`): esas contraseñas eran públicas. Al definir `ADMIN_EMAIL` y `ADMIN_PASSWORD` y reiniciar, el
+> servidor deja **inutilizables** las cuentas que todavía las usen; restablece su contraseña desde el panel
+> (Centros y usuarios), o elimínalas si eran de prueba. El panel muestra un aviso rojo mientras quede alguna.
 
 ### 5. Probar que funciona
 
@@ -88,11 +86,11 @@ curl https://diagnostic-os-backend.onrender.com/health
 # → {"ok":true}
 ```
 
-Y probar el login:
+Y probar el login del administrador (con el correo y la contraseña que definiste en `ADMIN_EMAIL` / `ADMIN_PASSWORD`):
 ```bash
 curl -X POST https://diagnostic-os-backend.onrender.com/api/auth/admin-login \
   -H "Content-Type: application/json" \
-  -d '{"email":"soporte@diagnosticos.app","password":"plataforma123"}'
+  -d '{"email":"TU_ADMIN_EMAIL","password":"TU_ADMIN_PASSWORD"}'
 ```
 Si te devuelve un `token`, el backend ya está vivo y conectado a Neon.
 
@@ -112,21 +110,25 @@ Si te devuelve un `token`, el backend ya está vivo y conectado a Neon.
 
 ## Conectar con el HCE (FHIR R4)
 
-Desde el panel de superadmin (`admin.html` → pestaña "Integraciones") configuras,
-por cada centro, la URL base y una clave de API del HCE.
+Un laboratorio puede trabajar con **varias clínicas a la vez**. Desde el panel de superadmin
+(`admin.html` → pestaña "Integraciones" → elegir el laboratorio) se crea **una conexión por cada clínica**; cada
+una tiene su propia clave de entrada y su propio destino de retorno, las órdenes quedan marcadas con su clínica y
+los resultados vuelven solo a ella. El panel muestra el id y la dirección del laboratorio (para pegarlos en la
+clínica) con botón de copiar. El detalle completo del contrato está en
+[`docs/INTEGRACION_CLINIC-OS.md`](docs/INTEGRACION_CLINIC-OS.md).
 
 **HCE → Diagnostic OS (entrada de órdenes):**
 ```
 POST /api/fhir/tenants/{tenantId}/ServiceRequest
-Headers: X-API-Key: <la clave configurada en el panel>
+Headers: X-API-Key: <la clave de ESA clínica, generada en su conexión>
 Body: un recurso FHIR ServiceRequest, con el Patient embebido en "contained"
 ```
 
 **Diagnostic OS → HCE (salida de informes):**
-Al publicar un informe, si el centro tiene conector configurado, se envía
+Al publicar un informe, si su orden vino de una clínica conectada, se envía a la dirección de ESA conexión
 automáticamente:
 ```
-POST {baseUrl}/DiagnosticReport   (Authorization: Bearer <apiKey>)
+POST {baseUrl}/DiagnosticReport   (Authorization: Bearer <token OAuth2 o clave de API>)
 ```
 
 **Consultas (pull) del HCE:**
@@ -146,19 +148,6 @@ cd backend
 cp .env.example .env       # pega tu DATABASE_URL de Neon y tus claves de Cloudinary
 npm install
 npx prisma migrate dev --name init
-npm run seed
+npm run create-admin       # con ADMIN_EMAIL y ADMIN_PASSWORD en el .env
 npm run dev
 ```
-
-## Siguiente paso: conectar el frontend
-
-El frontend todavía lee/escribe en `localStorage` (`src/lib/storage.js`). El
-siguiente paso es crear `src/lib/api.js` para que hable con esta API usando el
-token de `/api/auth/login` (o `/api/auth/admin-login` en `admin.html`). Dime
-cuándo quieres que lo arme.
-
-
-## Conexión con Clinic-OS (HCE)
-
-Ver [`docs/INTEGRACION_CLINIC-OS.md`](docs/INTEGRACION_CLINIC-OS.md): contrato completo, configuración paso a paso y variables de entorno.
-Las pruebas (`npm test`) levantan un Clinic-OS simulado y cubren el ciclo orden → estudio → informe → entrega con reintentos.

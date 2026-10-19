@@ -50,6 +50,8 @@ model Tenant {
   thirdPartyName     String  @default("Conector de terceros")
   thirdPartyType     String  @default("HIS / LIS / RIS / PACS")
   thirdPartyProtocol String  @default("A definir por contrato")
+  // ⚠ OBSOLETO: la conexión con sistemas externos ahora vive en el modelo Connection (una por clínica).
+  // Estos campos se conservan solo para migrar lo que ya estaba configurado; al migrarse se vacían.
   thirdPartyBaseUrl  String?
   // Clave estática. Se guarda CIFRADA (ver src/lib/secrets.js). Sirve para: (a) autenticar
   // llamadas salientes cuando thirdPartyAuthType = "apikey", y (b) por compatibilidad, como clave
@@ -86,6 +88,8 @@ model Tenant {
   quotes              Quote[]
   cashSessions        CashSession[]
   cashMovements       CashMovement[]
+
+  connections Connection[]
 }
 
 // dueno | platform_admin | recepcion | laboratorista | responsable_laboratorio |
@@ -102,6 +106,40 @@ model User {
   createdAt DateTime @default(now())
   auditEvents AuditEvent[]
   attachments Attachment[]
+}
+
+// Conexión de UN laboratorio/centro (tenant) con UNA clínica o sistema externo. Un centro puede tener
+// tantas como necesite; cada una tiene su propia clave de entrada y su propio destino de retorno.
+model Connection {
+  id       String  @id @default(cuid())
+  tenantId String
+  tenant   Tenant  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  name     String             // ej. "Clínica RDM"
+  type     String  @default("HCE")
+  protocol String  @default("FHIR R4")
+  enabled  Boolean @default(true)
+
+  // ENTRADA (la clínica nos envía órdenes): la clave identifica a la clínica. Solo se guarda su hash.
+  inboundKeyHash      String?   @unique
+  inboundKeyCreatedAt DateTime?
+
+  // SALIDA (le devolvemos los informes a esa clínica)
+  baseUrl      String?
+  authType     String  @default("oauth2") // oauth2 | apikey
+  tokenUrl     String?
+  clientId     String?
+  clientSecret String? // cifrado
+  apiKey       String? // cifrado
+  scope        String  @default("system/DiagnosticReport.write")
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  orders   Order[]
+  messages IntegrationMessage[]
+
+  @@index([tenantId])
 }
 
 model Patient {
@@ -158,11 +196,20 @@ model Order {
   receivedAt  DateTime?
   completedAt DateTime?
 
+  // Conexión (clínica) de la que vino la orden. Es lo que decide a dónde vuelve su resultado y
+  // evita confundir la orden "5" de una clínica con la "5" de otra. Null = orden creada dentro del laboratorio.
+  connectionId  String?
+  connection    Connection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
+  // "system" del identificador tal como lo envió la clínica (se devuelve idéntico en el informe).
+  externalSystem String?
+
   studies Study[]
   reports DiagnosticReport[]
 
   @@index([tenantId])
   @@index([tenantId, externalOrderId])
+  @@index([connectionId])
+  @@unique([tenantId, connectionId, externalOrderId])
 }
 
 model Study {
@@ -327,6 +374,8 @@ model IntegrationMessage {
   attempts      Int     @default(1)
 
   // Para poder reintentar un envío saliente: qué se mandó, por qué falló y cuándo reintentar.
+  connectionId String?
+  connection   Connection? @relation(fields: [connectionId], references: [id], onDelete: SetNull)
   entityType  String? // "DiagnosticReport"
   entityId    String?
   lastError   String?

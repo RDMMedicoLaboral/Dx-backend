@@ -6,6 +6,7 @@ const DEFAULTS = {
   study: () => ({ status: "scheduled", room: "", equipment: "", technician: "", bodySite: "", laterality: "", technique: "" }),
   patient: () => ({ matchStatus: "confirmado", documentType: "cedula", externalIdentifiers: [] }),
   tenant: () => ({ thirdPartyName: "Conector de terceros", thirdPartyAuthType: "apikey", thirdPartyScope: "system/DiagnosticReport.write", thirdPartyStatus: "No configurado", kind: "Laboratorio" }),
+  connection: () => ({ enabled: true, type: "HCE", protocol: "FHIR R4", authType: "oauth2", scope: "system/DiagnosticReport.write" }),
   integrationMessage: () => ({ status: "pending", attempts: 1, payloadSummary: "", eventId: crypto.randomUUID(), correlationId: crypto.randomUUID() }),
   diagnosticReport: () => ({ status: "draft", version: 1, resultIds: [], conclusion: "", findings: "", impression: "", amendmentReason: "" }),
   result: () => ({ status: "draft", flag: "normal", unit: "", referenceRange: "", method: "" }),
@@ -16,6 +17,7 @@ export function makeDb({ now = () => new Date() } = {}) {
   const clone = (o) => (o === undefined ? o : structuredClone(o));
 
   const cmp = (v, cond) => {
+    if (cond === null) return v === null || v === undefined; // en la base real, una columna sin valor es NULL
     if (cond && typeof cond === "object" && !(cond instanceof Date) && !Array.isArray(cond)) {
       return Object.entries(cond).every(([op, x]) => {
         if (op === "in") return x.includes(v);
@@ -83,12 +85,17 @@ export function makeDb({ now = () => new Date() } = {}) {
         for (let i = rows.length - 1; i >= 0; i--) if (match(rows[i], where)) { rows.splice(i, 1); count++; }
         return { count };
       },
+      async delete({ where }) {
+        const i = rows.findIndex((x) => match(x, where));
+        if (i < 0) throw new Error(`${name}: registro no encontrado`);
+        return clone(rows.splice(i, 1)[0]);
+      },
       async count({ where } = {}) { return rows.filter((x) => match(x, where)).length; },
       _rows: rows,
     };
   }
 
-  const models = ["tenant", "user", "patient", "order", "study", "specimen", "result", "diagnosticReport", "catalogItem", "appointment", "integrationMessage", "auditEvent", "attachment", "convenio", "quote", "cashSession", "cashMovement"];
+  const models = ["tenant", "user", "patient", "order", "study", "specimen", "result", "diagnosticReport", "catalogItem", "appointment", "integrationMessage", "auditEvent", "attachment", "convenio", "quote", "cashSession", "cashMovement", "connection"];
   const db = Object.fromEntries(models.map((m) => [m, delegate(m)]));
   db._tables = tables;
   return db;

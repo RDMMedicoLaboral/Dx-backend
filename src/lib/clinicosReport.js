@@ -9,7 +9,7 @@
 //   meta.versionId       = versión del informe (Clinic-Os deduplica por id + versión)
 // Los valores estructurados (Observation) y los adjuntos viajan solo en el perfil "full".
 // ---------------------------------------------------------------------------------
-import { reportToDiagnosticReport, SYSTEMS } from "./fhir.js";
+import { reportToDiagnosticReport, externalSystemOf, SYSTEMS } from "./fhir.js";
 
 export const MAX_TEXT = 3800; // Clinic-Os guarda hasta 4000 caracteres de resultado
 
@@ -47,7 +47,9 @@ export function buildClinicOsReport({ tenant, report, order, study, patient, res
       category: base.category,
       code: base.code,
       subject: { identifier: { system: SYSTEMS.cedula, value: patient.documentNumber } },
-      basedOn: [{ identifier: { system: SYSTEMS.clinicosLabOrder, value: String(labOrderId) } }],
+      // Se devuelve EXACTAMENTE el identificador que la clínica envió (mismo system y mismo value): así
+      // reconoce su orden aunque su formato incluya el id de la clínica. Si no envió "system", se usa el de Clinic-Os.
+      basedOn: [{ identifier: { system: externalSystemOf(order) || SYSTEMS.clinicosLabOrder, value: String(labOrderId) } }],
       effectiveDateTime: report.publishedAt ? new Date(report.publishedAt).toISOString() : undefined,
       performer: [{ display: tenant?.name || "Diagnostic OS" }],
       conclusion: text || undefined,

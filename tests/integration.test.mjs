@@ -14,12 +14,13 @@ const quiet = { warn() {}, error() {} };
 
 let clinic, db, integ;
 
-async function seed(tenantPatch = {}) {
+async function seed(connPatch = {}) {
   db = makeDb({ now });
   clinic = await startFakeClinicOs();
-  await db.tenant.create({ data: { id: "t1", name: "Lab San Rafael", thirdPartyName: "Clinic-OS", thirdPartyBaseUrl: clinic.baseUrl, thirdPartyAuthType: "oauth2", thirdPartyClientId: clinic.clientId, thirdPartyClientSecret: encryptSecret(clinic.clientSecret), ...tenantPatch } });
+  await db.tenant.create({ data: { id: "t1", name: "Lab San Rafael" } });
+  await db.connection.create({ data: { id: "c1", tenantId: "t1", name: "Clínica RDM", baseUrl: clinic.baseUrl, authType: "oauth2", clientId: clinic.clientId, clientSecret: encryptSecret(clinic.clientSecret), ...connPatch } });
   await db.patient.create({ data: { id: "p1", tenantId: "t1", firstName: "Ana", lastName: "Mora", documentNumber: "0912345678", sex: "F", birthDate: "1990-05-01" } });
-  await db.order.create({ data: { id: "o1", tenantId: "t1", patientId: "p1", externalOrderId: "LO-1001", sourceSystem: "urn:clinicos:lab-order", sourceType: "HCE" } });
+  await db.order.create({ data: { id: "o1", tenantId: "t1", patientId: "p1", connectionId: "c1", externalOrderId: "LO-1001", externalSystem: "urn:clinicos:lab-order", sourceType: "HCE" } });
   await db.study.create({ data: { id: "s1", tenantId: "t1", orderId: "o1", patientId: "p1", serviceCode: "LAB-GLU", serviceName: "Glucosa en ayunas", modality: "LAB", externalStudyId: "LO-1001" } });
   await db.result.create({ data: { id: "x1", tenantId: "t1", studyId: "s1", analyte: "Glucosa", value: "92", unit: "mg/dL", referenceRange: "70-100", status: "validated" } });
   await db.diagnosticReport.create({ data: { id: "r1", tenantId: "t1", studyId: "s1", orderId: "o1", patientId: "p1", type: "LAB", status: "published", resultIds: ["x1"], conclusion: "Normal", authorName: "Lic. Loor", publishedAt: now() } });
@@ -113,9 +114,10 @@ test("sirve con servidores OAuth2 'de libro' (formulario o HTTP Basic): prueba l
   for (const [style, expected] of [["form", ["json", "form"]], ["basic", ["json", "form", "basic"]]]) {
     db = makeDb({ now });
     clinic = await startFakeClinicOs({ authStyle: style });
-    await db.tenant.create({ data: { id: "t1", name: "L", thirdPartyBaseUrl: clinic.baseUrl, thirdPartyAuthType: "oauth2", thirdPartyClientId: clinic.clientId, thirdPartyClientSecret: encryptSecret(clinic.clientSecret) } });
+    await db.tenant.create({ data: { id: "t1", name: "L" } });
+    await db.connection.create({ data: { id: "c1", tenantId: "t1", name: "Clínica", baseUrl: clinic.baseUrl, authType: "oauth2", clientId: clinic.clientId, clientSecret: encryptSecret(clinic.clientSecret) } });
     await db.patient.create({ data: { id: "p1", tenantId: "t1", firstName: "A", lastName: "B", documentNumber: "1" } });
-    await db.order.create({ data: { id: "o1", tenantId: "t1", patientId: "p1", externalOrderId: "9" } });
+    await db.order.create({ data: { id: "o1", tenantId: "t1", patientId: "p1", connectionId: "c1", externalOrderId: "9" } });
     await db.study.create({ data: { id: "s1", tenantId: "t1", orderId: "o1", patientId: "p1", serviceCode: "X", serviceName: "X", modality: "LAB" } });
     await db.diagnosticReport.create({ data: { id: "r1", tenantId: "t1", studyId: "s1", orderId: "o1", patientId: "p1", type: "LAB", status: "published" } });
     integ = createIntegration({ db, now, log: quiet });
@@ -183,7 +185,7 @@ test("falla permanente (422): NO se reintenta sola", async () => {
 });
 
 test("credenciales malas: falla sin reintento automático y con mensaje claro", async () => {
-  await seed({ thirdPartyClientSecret: encryptSecret("incorrecto") });
+  await seed({ clientSecret: encryptSecret("incorrecto") });
   const r = await integ.pushReport("t1", "r1");
   assert.equal(r.message.status, "failed");
   assert.match(r.message.lastError, /OAuth2.*credenciales inválidas/);
@@ -237,15 +239,32 @@ test("un mensaje fallido de una versión vieja no se reenvía con el contenido d
   await clinic.close();
 });
 
-test("centro sin conector configurado: no hace nada", async () => {
-  await seed({ thirdPartyBaseUrl: null });
-  assert.ok((await integ.pushReport("t1", "r1")).skipped);
+test("conexión sin destino de retorno o desactivada: queda registrado como 'No enviado' y no toca la red", async () => {
+  await seed({ baseUrl: null });
+  const a = await integ.pushReport("t1", "r1");
+  assert.equal(a.message.status, "skipped");
+  assert.match(a.message.payloadSummary, /NO enviado: .*no tiene configurado el destino/);
+  await clinic.close();
+
+  await seed({ enabled: false });
+  const b = await integ.pushReport("t1", "r1");
+  assert.equal(b.message.status, "skipped");
+  assert.match(b.message.payloadSummary, /desactivada/);
+  assert.equal(clinic.state.tokenRequests.length + clinic.state.received.length, 0);
+  await clinic.close();
+});
+
+test("una orden creada dentro del laboratorio (sin clínica) no genera ningún envío ni mensaje", async () => {
+  await seed();
+  await db.order.update({ where: { id: "o1" }, data: { connectionId: null } });
+  const r = await integ.pushReport("t1", "r1");
+  assert.ok(r.skipped && !r.message);
   assert.equal(msgs().length, 0);
   await clinic.close();
 });
 
 test("modo clave de API: manda 'Authorization: Bearer <clave>' y el FHIR completo, sin pedir token", async () => {
-  await seed({ thirdPartyAuthType: "apikey", thirdPartyApiKey: encryptSecret("clave-fija") });
+  await seed({ authType: "apikey", apiKey: encryptSecret("clave-fija") });
   let seenAuth = null, seenBody = null;
   const realFetch = globalThis.fetch;
   integ = createIntegration({ db, now, log: quiet, fetchImpl: async (url, opts) => { seenAuth = opts.headers.Authorization; seenBody = JSON.parse(opts.body); return new Response("{}", { status: 200 }); } });
@@ -260,7 +279,7 @@ test("modo clave de API: manda 'Authorization: Bearer <clave>' y el FHIR complet
 
 test("mensajes colgados (el servidor se reinició a mitad del envío) se rescatan", async () => {
   await seed();
-  await db.integrationMessage.create({ data: { tenantId: "t1", type: "ReportPublished", direction: "outbound", source: "DX", destination: "C", status: "retrying", entityType: "DiagnosticReport", entityId: "r1", eventId: "report:r1:v1" } });
+  await db.integrationMessage.create({ data: { tenantId: "t1", type: "ReportPublished", direction: "outbound", source: "DX", destination: "C", connectionId: "c1", status: "retrying", entityType: "DiagnosticReport", entityId: "r1", eventId: "report:r1:v1" } });
   advance(30);
   await integ.retryDue();
   assert.equal(msgs()[0].status, "acknowledged");
@@ -269,14 +288,14 @@ test("mensajes colgados (el servidor se reinició a mitad del envío) se rescata
 
 test("probar conexión: informa cada paso y detecta credenciales malas", async () => {
   await seed();
-  const ok = await integ.testConnection("t1");
+  const ok = await integ.testConnection("t1", "c1");
   assert.equal(ok.ok, true);
   assert.deepEqual(ok.steps.map((s) => s.step), ["Configuración", "Token OAuth2", "Servidor FHIR (/metadata)"]);
   assert.equal(clinic.state.received.length, 0, "no envía datos clínicos");
   await clinic.close();
 
-  await seed({ thirdPartyClientSecret: encryptSecret("mal") });
-  const bad = await integ.testConnection("t1");
+  await seed({ clientSecret: encryptSecret("mal") });
+  const bad = await integ.testConnection("t1", "c1");
   assert.equal(bad.ok, false);
   assert.equal(bad.steps.at(-1).step, "Token OAuth2");
   await clinic.close();

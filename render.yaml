@@ -29,7 +29,9 @@ services:
         sync: false
       - key: INTEGRATION_ENC_KEY
         generateValue: true # cifra los secretos de integración guardados en la base
-      - key: SEED_KEY
-        generateValue: true
+      - key: ADMIN_EMAIL
+        sync: false # correo del administrador de plataforma (lo defines tú)
+      - key: ADMIN_PASSWORD
+        sync: false # contraseña del administrador (mínimo 12 caracteres); se aplica al arrancar
       - key: NODE_ENV
         value: production

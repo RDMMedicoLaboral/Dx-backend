@@ -2,13 +2,18 @@ import { reportToDiagnosticReport } from "./fhir.js";
 import { buildClinicOsReport } from "./clinicosReport.js";
 import { loadReportContext } from "./reportContext.js";
 import { createTokenProvider, fetchWithTimeout } from "./oauthClient.js";
-import { decryptSecret } from "./secrets.js";
+import { connectionConfig } from "./connections.js";
 
 // ---------------------------------------------------------------------------------
-// Envío de informes publicados hacia el sistema externo (HCE / Clinic-OS).
+// Envío de informes publicados hacia la clínica (sistema externo) que pidió el examen.
+//
+// REGLA DE ORO: un informe vuelve ÚNICAMENTE a la conexión de la orden que lo originó
+// (order.connectionId). Nunca se "elige" un destino por centro, ni por nombre, ni por defecto:
+// con varias clínicas conectadas al mismo laboratorio eso mezclaría resultados entre pacientes de
+// clínicas distintas. Además hay una comprobación defensiva antes de cada envío.
 //
 // Garantías:
-//  - Cada envío queda registrado como IntegrationMessage (visible en el panel), salga bien o mal.
+//  - Cada envío queda registrado como IntegrationMessage (con su conexión), salga bien o mal.
 //  - Si falla por algo transitorio (red caída, 5xx, 429, timeout) se reintenta solo, con espera
 //    creciente: 1 min, 5, 15, 1 h, 4 h (máx. 6 intentos). Si falla por algo permanente (400, 403,
 //    404, 422, credenciales malas) NO se reintenta solo: queda en "failed" a la espera de que
@@ -32,24 +37,9 @@ const trimSlash = (u) => String(u || "").replace(/\/+$/, "");
 export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () => new Date(), tokenProvider, log = console, profileOverride } = {}) {
   const tokens = tokenProvider || createTokenProvider({ fetchImpl, now: () => now().getTime() });
 
-  function connectorOf(tenant) {
-    const baseUrl = trimSlash(tenant?.thirdPartyBaseUrl);
-    const authType = tenant?.thirdPartyAuthType === "oauth2" ? "oauth2" : "apikey";
-    return {
-      baseUrl,
-      authType,
-      apiKey: decryptSecret(tenant?.thirdPartyApiKey),
-      tokenUrl: tenant?.thirdPartyTokenUrl ? tenant.thirdPartyTokenUrl : baseUrl ? `${baseUrl}/oauth/token` : "",
-      clientId: tenant?.thirdPartyClientId || "",
-      clientSecret: decryptSecret(tenant?.thirdPartyClientSecret) || "",
-      scope: tenant?.thirdPartyScope || "system/DiagnosticReport.write",
-      name: tenant?.thirdPartyName || "Conector de terceros",
-    };
-  }
-
   // Perfil del contenido que se envía:
   //  "clinicos" -> lo que Clinic-Os sabe recibir (cédula + orden original + texto del resultado).
-  //                Es el predeterminado cuando el conector usa OAuth2.
+  //                Es el predeterminado cuando la conexión usa OAuth2.
   //  "full"     -> FHIR completo y autocontenido (Observations, adjuntos). Predeterminado con clave de API.
   // Se puede forzar con la variable INTEGRATION_PAYLOAD_PROFILE=full|clinicos.
   function profileOf(cfg) {
@@ -58,9 +48,10 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
     return cfg.authType === "oauth2" ? "clinicos" : "full";
   }
 
-  async function authHeader(tenantId, cfg, { forceRefresh = false } = {}) {
+  // El token se guarda en caché POR CONEXIÓN (no por centro): dos clínicas nunca comparten credenciales.
+  async function authHeader(cfg, { forceRefresh = false } = {}) {
     if (cfg.authType === "oauth2") {
-      const token = await tokens.getToken({ cacheKey: tenantId, tokenUrl: cfg.tokenUrl, clientId: cfg.clientId, clientSecret: cfg.clientSecret, scope: cfg.scope }, { forceRefresh });
+      const token = await tokens.getToken({ cacheKey: cfg.id, tokenUrl: cfg.tokenUrl, clientId: cfg.clientId, clientSecret: cfg.clientSecret, scope: cfg.scope }, { forceRefresh });
       return { Authorization: `Bearer ${token}` };
     }
     return cfg.apiKey ? { Authorization: `Bearer ${cfg.apiKey}` } : {};
@@ -68,10 +59,18 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
 
   const backoffAt = (attempts) => new Date(now().getTime() + BACKOFF_MINUTES[Math.min(attempts - 1, BACKOFF_MINUTES.length - 1)] * 60000);
 
-  /** Hace el POST y devuelve { status: "acknowledged"|"duplicate"|"failed", retryable, detail }. */
-  async function deliver(tenant, report) {
-    const cfg = connectorOf(tenant);
+  /** Hace el POST y devuelve { status: "acknowledged"|"duplicate"|"skipped"|"failed", retryable, detail }. */
+  async function deliver(tenant, connection, report) {
+    const cfg = connectionConfig(connection);
+    if (connection.enabled === false) return { status: "skipped", detail: `La conexión con ${cfg.name} está desactivada.` };
+    if (!cfg.baseUrl) return { status: "skipped", detail: `La conexión con ${cfg.name} no tiene configurado el destino de retorno (URL base).` };
+
     const ctx = await loadReportContext(db, report);
+    // Defensa final: el informe SOLO puede salir hacia la conexión de su orden y de su propio centro.
+    if (!ctx.order || ctx.order.connectionId !== connection.id || connection.tenantId !== report.tenantId) {
+      throw Object.assign(new Error("Bloqueado: la orden de este informe no pertenece a esta conexión."), { retryable: false });
+    }
+
     let payload;
     if (profileOf(cfg) === "clinicos") {
       const built = buildClinicOsReport({ tenant, report, order: ctx.order, study: ctx.study, patient: ctx.patient, results: ctx.results });
@@ -89,13 +88,13 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
 
     const post = async (forceRefresh) => fetchWithTimeout(fetchImpl, url, {
       method: "POST",
-      headers: { ...baseHeaders, ...(await authHeader(tenant.id, cfg, { forceRefresh })) },
+      headers: { ...baseHeaders, ...(await authHeader(cfg, { forceRefresh })) },
       body: JSON.stringify(payload),
     });
 
     let res = await post(false);
     if (res.status === 401 && cfg.authType === "oauth2") { // el token pudo vencer/revocarse: pide uno nuevo una vez
-      tokens.invalidate(tenant.id);
+      tokens.invalidate(cfg.id);
       res = await post(true);
     }
 
@@ -114,18 +113,18 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
   }
 
   /** Ejecuta un intento sobre un mensaje ya existente y deja el resultado registrado. */
-  async function attempt(message, tenant, report, attempts) {
+  async function attempt(message, tenant, connection, report, attempts) {
     let outcome;
     try {
-      outcome = await deliver(tenant, report);
+      outcome = await deliver(tenant, connection, report);
     } catch (err) {
       outcome = { status: "failed", retryable: err.retryable !== false, detail: err.message };
     }
 
     const failed = outcome.status === "failed";
-    const skipped = outcome.status === "skipped"; // no tenía sentido enviarlo (p. ej. orden que no vino de Clinic-Os)
+    const skipped = outcome.status === "skipped"; // no tenía sentido enviarlo (conexión desactivada, sin destino, paciente sin cédula…)
     const prefix = skipped ? "NO enviado: " : "";
-    const summary = `DiagnosticReport/${report.id} v${report.version || 1} → ${trimSlash(tenant.thirdPartyBaseUrl)} — ${prefix}${outcome.detail}`.slice(0, 500);
+    const summary = `DiagnosticReport/${report.id} v${report.version || 1} → ${connection.name} — ${prefix}${outcome.detail}`.slice(0, 500);
     const canRetry = failed && outcome.retryable && attempts < MAX_ATTEMPTS;
     return db.integrationMessage.update({
       where: { id: message.id },
@@ -140,16 +139,20 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
   }
 
   /**
-   * Envía (o encola) un informe publicado. Nunca lanza: los errores quedan en el mensaje.
+   * Envía (o encola) un informe publicado a la conexión de SU orden. Nunca lanza: los errores quedan en el mensaje.
    * opts.force = true → crea un envío nuevo aunque ya haya uno exitoso (reenvío manual).
    */
   async function pushReport(tenantId, reportId, opts = {}) {
-    const tenant = await db.tenant.findUnique({ where: { id: tenantId } });
-    if (!tenant?.thirdPartyBaseUrl) return { skipped: "El centro no tiene conector configurado." };
-
     const report = await db.diagnosticReport.findFirst({ where: { id: reportId, tenantId } });
     if (!report) return { skipped: "Informe no encontrado." };
     if (!SENDABLE.includes(report.status)) return { skipped: "El informe todavía no está publicado." };
+
+    const order = await db.order.findFirst({ where: { id: report.orderId, tenantId } });
+    // Orden creada dentro del laboratorio (no vino de ninguna clínica): no hay a quién devolverla.
+    if (!order?.connectionId) return { skipped: "La orden se creó dentro del laboratorio; no viene de ninguna clínica conectada." };
+    const connection = await db.connection.findFirst({ where: { id: order.connectionId, tenantId } });
+    if (!connection) return { skipped: "La conexión de la que vino esta orden ya no existe." };
+    const tenant = await db.tenant.findUnique({ where: { id: tenantId } });
 
     const eventId = `report:${report.id}:v${report.version || 1}`;
     const existing = await db.integrationMessage.findFirst({ where: { tenantId, direction: "outbound", entityType: "DiagnosticReport", entityId: report.id, eventId }, orderBy: { createdAt: "desc" } });
@@ -159,13 +162,13 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
 
     const message = await db.integrationMessage.create({
       data: {
-        tenantId, type: "ReportPublished", direction: "outbound", source: "Diagnostic OS", destination: tenant.thirdPartyName || "Conector de terceros",
+        tenantId, connectionId: connection.id, type: "ReportPublished", direction: "outbound", source: "Diagnostic OS", destination: connection.name,
         status: "pending", attempts: 1, entityType: "DiagnosticReport", entityId: report.id,
         eventId: existing ? `${eventId}:r${now().getTime()}` : eventId,
-        payloadSummary: `DiagnosticReport/${report.id} v${report.version || 1} → ${trimSlash(tenant.thirdPartyBaseUrl)}`,
+        payloadSummary: `DiagnosticReport/${report.id} v${report.version || 1} → ${connection.name}`,
       },
     });
-    const updated = await attempt(message, tenant, report, 1);
+    const updated = await attempt(message, tenant, connection, report, 1);
     return { message: updated };
   }
 
@@ -178,8 +181,9 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
     const message = await db.integrationMessage.findUnique({ where: { id: messageId } });
     const give = (reason) => db.integrationMessage.update({ where: { id: messageId }, data: { status: "failed", lastError: reason, nextRetryAt: null, payloadSummary: `${message.payloadSummary} — ${reason}`.slice(0, 500) } }).then((m) => ({ message: m }));
 
+    const connection = message.connectionId ? await db.connection.findFirst({ where: { id: message.connectionId, tenantId: message.tenantId } }) : null;
+    if (!connection) return give("La conexión ya no existe.");
     const tenant = await db.tenant.findUnique({ where: { id: message.tenantId } });
-    if (!tenant?.thirdPartyBaseUrl) return give("El centro ya no tiene conector configurado.");
     const report = message.entityId ? await db.diagnosticReport.findFirst({ where: { id: message.entityId, tenantId: message.tenantId } }) : null;
     if (!report) return give("El informe ya no existe.");
     if (!SENDABLE.includes(report.status)) return give("El informe ya no está publicado.");
@@ -187,8 +191,7 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
     if ((message.eventId || "").split(":")[2] !== `v${report.version || 1}`) return give("Superado por una versión más reciente del informe.");
 
     const attempts = (message.attempts || 1) + 1;
-    const updated = await attempt(message, tenant, report, attempts);
-    // Un reintento manual que vuelve a fallar con causa transitoria queda programado de nuevo.
+    const updated = await attempt(message, tenant, connection, report, attempts);
     if (manual && updated.status === "failed" && !updated.nextRetryAt && attempts >= MAX_ATTEMPTS) log.warn?.(`[integración] ${messageId} agotó los reintentos automáticos`);
     return { message: updated };
   }
@@ -212,18 +215,19 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
   }
 
   /** Verifica la conexión paso a paso, sin enviar ningún dato clínico. */
-  async function testConnection(tenantId) {
-    const tenant = await db.tenant.findUnique({ where: { id: tenantId } });
+  async function testConnection(tenantId, connectionId) {
+    const connection = await db.connection.findFirst({ where: { id: connectionId, tenantId } });
     const steps = [];
     const add = (step, ok, detail, warning = false) => steps.push({ step, ok, detail, ...(warning ? { warning: true } : {}) });
-    const cfg = connectorOf(tenant);
+    if (!connection) { add("Configuración", false, "La conexión no existe."); return { ok: false, steps }; }
+    const cfg = connectionConfig(connection);
 
-    if (!cfg.baseUrl) { add("Configuración", false, "Falta la URL base del sistema externo."); return { ok: false, steps }; }
+    if (!cfg.baseUrl) { add("Configuración", false, "Falta la URL base del sistema de la clínica (a donde devolvemos los informes)."); return { ok: false, steps }; }
     add("Configuración", true, `${cfg.name} · ${cfg.baseUrl} · autenticación ${cfg.authType === "oauth2" ? "OAuth2 client_credentials" : "clave de API"}`);
 
     let headers = {};
     try {
-      headers = await authHeader(tenantId, cfg, { forceRefresh: true });
+      headers = await authHeader(cfg, { forceRefresh: true });
       add(cfg.authType === "oauth2" ? "Token OAuth2" : "Credencial", Boolean(headers.Authorization), cfg.authType === "oauth2" ? `Token obtenido (scope solicitado: ${cfg.scope})` : headers.Authorization ? "Clave de API presente" : "No hay clave configurada (se enviará sin autenticación)", !headers.Authorization);
     } catch (err) {
       add("Token OAuth2", false, err.message);
@@ -241,5 +245,5 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
     return { ok: steps.every((s) => s.ok || s.warning), steps };
   }
 
-  return { pushReport, retryMessage, retryDue, testConnection, connectorOf };
+  return { pushReport, retryMessage, retryDue, testConnection };
 }
