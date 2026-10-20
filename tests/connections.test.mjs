@@ -43,6 +43,7 @@ test("(preparación) un laboratorio con dos clínicas y un tercer centro aparte"
   clinicA = await startFakeClinicOs({ clientId: "rdm", clientSecret: "secret-rdm" });
   clinicB = await startFakeClinicOs({ clientId: "santaana", clientSecret: "secret-santaana" });
   const app = express();
+  app.use("/api/fhir", (await import("../src/lib/bodyParsers.js")).fhirJsonParser);
   app.use(express.json({ limit: "2mb" }));
   app.use("/api/fhir", fhirRoutes);
   app.use("/api/state", stateRoutes);
@@ -222,4 +223,38 @@ test("guardar el estado desde el navegador no pierde la conexión de la orden ni
   assert.ok(after.every((o) => o.externalSystem === "urn:clinicos:lab-order"));
   const pat = db.patient._rows.find((p) => p.documentNumber === "0912345678");
   assert.ok(pat.externalIdentifiers.some((e) => e.connectionId === "cA") && pat.externalIdentifiers.some((e) => e.connectionId === "cB"));
+});
+
+// ---------------- tipos de contenido y mensajes de error claros ----------------
+const raw = async (body, contentType, key = keyA) => {
+  const res = await fetch(`${base}/api/fhir/tenants/t1/ServiceRequest`, { method: "POST", headers: { ...(contentType ? { "Content-Type": contentType } : {}), "X-API-Key": key }, body });
+  let json = null; try { json = await res.json(); } catch { /* vacío */ }
+  return { status: res.status, body: json };
+};
+
+test("la orden se acepta con application/fhir+json, application/json, con charset o sin tipo de contenido", async () => {
+  let n = 100;
+  for (const ct of ["application/fhir+json", "application/fhir+json; charset=utf-8", "application/json", "application/json; charset=utf-8", "text/plain", null]) {
+    const r = await raw(JSON.stringify(sr(String(++n), "CT-" + n)), ct);
+    assert.equal(r.status, 201, `content-type ${ct}: ${JSON.stringify(r.body)}`);
+  }
+});
+
+test("si el mensaje está mal, el error dice QUÉ llegó (para que la clínica lo corrija)", async () => {
+  const empty = await raw("", "application/fhir+json");
+  assert.equal(empty.status, 400);
+  assert.match(empty.body.error, /cuerpo vacío o que no es JSON \(content-type recibido: application\/fhir\+json\)/);
+
+  const wrongType = await raw(JSON.stringify({ resourceType: "Patient" }), "application/json");
+  assert.match(wrongType.body.error, /resourceType "Patient"/);
+
+  const wrapped = await raw(JSON.stringify({ resource: sr("200", "W-1") }), "application/json");
+  assert.match(wrapped.body.error, /envuelto dentro de un campo "resource"/);
+
+  const bundle = await raw(JSON.stringify({ resourceType: "Bundle", type: "transaction", entry: [{ resource: { resourceType: "Patient" } }, { resource: { resourceType: "Observation" } }] }), "application/json");
+  assert.match(bundle.body.error, /Bundle sin ningún ServiceRequest.*Patient, Observation/);
+
+  const broken = await raw("{esto no es json", "application/fhir+json");
+  assert.equal(broken.status, 400);
+  assert.equal(empty.body.resourceType, "OperationOutcome");
 });

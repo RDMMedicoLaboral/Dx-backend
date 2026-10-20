@@ -31,6 +31,7 @@ const serviceRequest = (id, over = {}) => ({ resourceType: "ServiceRequest", id,
 before(async () => {
   clinic = await startFakeClinicOs();
   const app = express();
+  app.use("/api/fhir", (await import("../src/lib/bodyParsers.js")).fhirJsonParser);
   app.use(express.json({ limit: "2mb" }));
   app.use("/api/admin", adminRoutes);
   app.use("/api/fhir", fhirRoutes);

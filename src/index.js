@@ -14,6 +14,7 @@ import stateRoutes from "./routes/state.js";
 import catalogImportRoutes from "./routes/catalogImport.js";
 import { startRetryWorker } from "./lib/integration.js";
 import { runStartupSecurity } from "./lib/bootstrap.js";
+import { fhirJsonParser } from "./lib/bodyParsers.js";
 import { migrateLegacyConnections, ensureOrderUniqueIndex } from "./lib/connections.js";
 import { prisma } from "./lib/prisma.js";
 
@@ -30,6 +31,7 @@ app.use(cors({
   origin: allowedOrigins.length ? allowedOrigins : true, // en desarrollo, permite cualquier origen
   credentials: false,
 }));
+app.use("/api/fhir", fhirJsonParser); // la API FHIR acepta application/fhir+json, application/json o sin tipo
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("tiny"));
 

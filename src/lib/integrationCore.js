@@ -81,8 +81,9 @@ export function createIntegration({ db, fetchImpl = globalThis.fetch, now = () =
     }
     const url = `${cfg.baseUrl}/DiagnosticReport`;
     const baseHeaders = {
-      "Content-Type": "application/fhir+json",
-      Accept: "application/fhir+json",
+      // "application/json" lo entiende cualquier servidor (los lectores JSON de Express ignoran "application/fhir+json" por defecto).
+      "Content-Type": "application/json",
+      Accept: "application/fhir+json, application/json",
       "Idempotency-Key": `${report.id}:v${report.version || 1}`,
     };
 

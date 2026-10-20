@@ -16,6 +16,8 @@ const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).cat
 // Respuesta de error en formato FHIR (OperationOutcome). Se mantiene también "error" en texto
 // plano para no romper a quien ya lo leía.
 function outcome(res, status, code, message) {
+  // Deja rastro en el log del servidor de por qué se rechazó (sin datos del paciente): ayuda a la clínica a corregir su envío.
+  if (status >= 400 && status < 500 && status !== 401) console.warn(`[fhir] ${status} ${message} (content-type: ${res.req?.headers?.["content-type"] || "ninguno"})`);
   return res.status(status).json({
     resourceType: "OperationOutcome",
     issue: [{ severity: "error", code, diagnostics: message }],
@@ -94,7 +96,16 @@ router.post("/tenants/:tenantId/ServiceRequest", requireConnectionKey, wrap(asyn
   const tenantId = tenant.id;
   const { requests, patientResource } = extractParts(req.body || {});
 
-  if (!requests.length) return outcome(res, 400, "invalid", "Se esperaba un recurso FHIR ServiceRequest (o un Bundle con ServiceRequest).");
+  if (!requests.length) {
+    // Dice QUÉ llegó, para que quien envía vea de inmediato qué está mal en su mensaje.
+    const body = req.body;
+    const got = !body || typeof body !== "object" || !Object.keys(body).length
+      ? `un cuerpo vacío o que no es JSON (content-type recibido: ${req.headers["content-type"] || "ninguno"})`
+      : body.resourceType === "Bundle"
+        ? `un Bundle sin ningún ServiceRequest dentro de "entry[].resource" (tipos recibidos: ${(body.entry || []).map((e) => e?.resource?.resourceType || "?").join(", ") || "ninguno"})`
+        : `resourceType "${body.resourceType ?? "(no indicado)"}"${body.resource ? ' — el recurso parece venir envuelto dentro de un campo "resource"; debe enviarse directamente' : ""}`;
+    return outcome(res, 400, "invalid", `Se esperaba un recurso FHIR ServiceRequest (o un Bundle con ServiceRequest). Se recibió ${got}.`);
+  }
   if (!patientResource) return outcome(res, 422, "required", "No se pudo determinar el paciente. Incluye un recurso Patient en 'contained' (o en el Bundle).");
   const doc = pickDocumentIdentifier(patientResource);
   if (!doc) return outcome(res, 422, "required", "El Patient debe traer al menos un identifier con la cédula (el primero se toma como documento).");

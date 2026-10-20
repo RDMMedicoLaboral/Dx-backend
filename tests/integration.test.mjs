@@ -40,7 +40,7 @@ test("camino feliz (perfil Clinic-OS): token por JSON + cédula + orden original
   assert.deepEqual(clinic.state.tokenRequests[0], { mode: "json", scope: "system/DiagnosticReport.write", grant: "client_credentials" });
 
   const got = clinic.state.received[0];
-  assert.equal(got.contentType, "application/fhir+json");
+  assert.equal(got.contentType, "application/json");
   assert.equal(got.key, "r1:v1");
   const b = got.body;
   assert.deepEqual(b.subject, { identifier: { system: "urn:ec:cedula", value: "0912345678" } }, "paciente solo por cédula, sin referencias internas");
