@@ -99,3 +99,23 @@ export async function migrateLegacyConnections(db, { tenantId, log = console } =
   }
   return migrated;
 }
+
+/**
+ * Índice único (laboratorio + conexión + número de orden de la clínica) para que dos envíos simultáneos
+ * de la misma orden no puedan crear dos órdenes. Se crea con SQL al arrancar en lugar de declararlo en el
+ * esquema de Prisma: así `prisma db push` nunca se bloquea sobre una tabla con datos. Si ya existieran
+ * duplicados, no se puede crear: se avisa en el log y el sistema sigue funcionando (la deduplicación de la
+ * aplicación sigue activa). Es idempotente.
+ */
+export async function ensureOrderUniqueIndex(db, { log = console } = {}) {
+  if (typeof db.$executeRawUnsafe !== "function") return { status: "skipped" };
+  try {
+    await db.$executeRawUnsafe(
+      'CREATE UNIQUE INDEX IF NOT EXISTS "Order_tenant_connection_external_key" ON "Order" ("tenantId", "connectionId", "externalOrderId") WHERE "connectionId" IS NOT NULL AND "externalOrderId" IS NOT NULL',
+    );
+    return { status: "ok" };
+  } catch (err) {
+    log.warn?.(`[conexiones] No se pudo crear el índice único de órdenes (¿hay órdenes duplicadas de una misma clínica?): ${err.message}`);
+    return { status: "failed", reason: err.message };
+  }
+}

@@ -14,7 +14,7 @@ import stateRoutes from "./routes/state.js";
 import catalogImportRoutes from "./routes/catalogImport.js";
 import { startRetryWorker } from "./lib/integration.js";
 import { runStartupSecurity } from "./lib/bootstrap.js";
-import { migrateLegacyConnections } from "./lib/connections.js";
+import { migrateLegacyConnections, ensureOrderUniqueIndex } from "./lib/connections.js";
 import { prisma } from "./lib/prisma.js";
 
 if (!process.env.JWT_SECRET) {
@@ -34,7 +34,9 @@ app.use(express.json({ limit: "2mb" }));
 app.use(morgan("tiny"));
 
 app.get("/", (_req, res) => res.json({ ok: true, service: "diagnostic-os-backend" }));
-app.get("/health", (_req, res) => res.json({ ok: true }));
+// "features" sirve para comprobar de un vistazo QUÉ versión está corriendo realmente en el servidor
+// (abre https://tu-backend.onrender.com/health en el navegador).
+app.get("/health", (_req, res) => res.json({ ok: true, version: "2026-10-19", features: ["connections-per-clinic", "oauth2-outbound", "secure-admin-bootstrap"] }));
 
 // El orden importa: como clinicalRoutes se monta en el prefijo genérico "/api",
 // tiene que ir DESPUÉS de todas las rutas más específicas (/api/auth,
@@ -43,6 +45,9 @@ app.get("/health", (_req, res) => res.json({ ok: true }));
 // "/api/..." antes de que le toque el turno a las demás.
 app.use("/api/auth", authRoutes);
 app.use("/api/admin", adminRoutes);
+// Si una ruta de administrador no existe (p. ej. el servidor quedó con una versión vieja), responder 404 claro
+// en lugar de dejar que la petición caiga en las rutas de centros y devuelva un error engañoso.
+app.use("/api/admin", (_req, res) => res.status(404).json({ error: "Ruta no encontrada en el servidor. Si acabas de actualizar, el backend puede no haberse desplegado todavía (revisa /health)." }));
 app.use("/api/fhir", fhirRoutes);
 app.use("/api/public", publicRoutes);
 app.use("/api/uploads", uploadRoutes);
@@ -60,5 +65,6 @@ app.listen(port, () => {
   console.log(`Diagnostic OS backend escuchando en el puerto ${port}`);
   startRetryWorker(); // reintenta solo los envíos fallidos hacia el sistema conectado
   runStartupSecurity({ db: prisma }); // crea/actualiza el admin desde ADMIN_EMAIL/ADMIN_PASSWORD y avisa de contraseñas públicas
+  ensureOrderUniqueIndex(prisma);
   migrateLegacyConnections(prisma).catch((err) => console.error("[conexiones] No se pudo migrar la configuración anterior:", err.message)); // un conector por centro -> una conexión por clínica
 });

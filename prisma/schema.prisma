@@ -209,7 +209,9 @@ model Order {
   @@index([tenantId])
   @@index([tenantId, externalOrderId])
   @@index([connectionId])
-  @@unique([tenantId, connectionId, externalOrderId])
+  // (La unicidad de [tenantId, connectionId, externalOrderId] se crea al arrancar el servidor, ver
+  //  ensureOrderUniqueIndex en src/lib/connections.js: declararla aquí haría que `prisma db push` se negara
+  //  a aplicar el cambio sobre una tabla con datos y el despliegue en Render fallaría.)
 }
 
 model Study {
